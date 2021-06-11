@@ -25,11 +25,20 @@ case class ElectionResult(topicPartition: TopicPartition, leaderAndIsr: Option[L
 
 object Election {
 
+  /**
+   *
+   * @param partition
+   * @param leaderAndIsrOpt
+   * @param uncleanLeaderElectionEnabled
+   * @param controllerContext
+   * @return
+   */
   private def leaderForOffline(partition: TopicPartition,
                                leaderAndIsrOpt: Option[LeaderAndIsr],
                                uncleanLeaderElectionEnabled: Boolean,
                                controllerContext: ControllerContext): ElectionResult = {
 
+    //
     val assignment = controllerContext.partitionReplicaAssignment(partition)
     val liveReplicas = assignment.filter(replica => controllerContext.isReplicaOnline(replica, partition))
     leaderAndIsrOpt match {
@@ -96,12 +105,26 @@ object Election {
     }
   }
 
+  /**
+   *
+   * @param partition           分区
+   * @param leaderAndIsr        分区副本详情
+   * @param controllerContext   集群元数据缓存
+   * @return
+   */
   private def leaderForPreferredReplica(partition: TopicPartition,
                                         leaderAndIsr: LeaderAndIsr,
                                         controllerContext: ControllerContext): ElectionResult = {
+    // 从缓存中获取分区的副本元数据
     val assignment = controllerContext.partitionReplicaAssignment(partition)
+
+    // 过滤掉离线的副本，得到在线副本列表
     val liveReplicas = assignment.filter(replica => controllerContext.isReplicaOnline(replica, partition))
+
+    // 获取ISR集合
     val isr = leaderAndIsr.isr
+
+    // 执行preferred-replica选举
     val leaderOpt = PartitionLeaderElectionAlgorithms.preferredReplicaPartitionLeaderElection(assignment, isr, liveReplicas.toSet)
     val newLeaderAndIsrOpt = leaderOpt.map(leader => leaderAndIsr.newLeader(leader))
     ElectionResult(partition, newLeaderAndIsrOpt, assignment)

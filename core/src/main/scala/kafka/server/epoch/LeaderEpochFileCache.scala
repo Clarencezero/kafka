@@ -29,6 +29,14 @@ import scala.collection.{Seq, mutable}
 import scala.jdk.CollectionConverters._
 
 /**
+ * Kafka使用High Watermark（HW）来决定副本备份进度。而HW值的更新通常需要下一轮的FETCH REQUEST才能完成。
+ * 如果没有下一轮的FETCH REQUEST，那么Leader副本就不会更新Follower的消息位移。总结会导致以下两种情况：
+ * 1.备份数据丢失。2.备份数据不一致
+ *
+ * Kafka0.11版本后引入Leader Epoch来取代HW。Leader副本会有专门的缓存存储Leader Epoch值。
+ * Leader副本会保存 {@link EpochEntry} 缓存值，并定期写入到一个 checkpoint文件中
+ *
+ *
  * Represents a cache of (LeaderEpoch => Offset) mappings for a particular replica.
  *
  * Leader Epoch = epoch assigned to each leader by the controller.
@@ -294,7 +302,11 @@ class LeaderEpochFileCache(topicPartition: TopicPartition,
 
 }
 
-// Mapping of epoch to the first offset of the subsequent epoch
+/**
+ * Leader Epoch POJO
+ * @param epoch         Leader版本号，从0开始递增+1。每当Leader变更时，epoch+=1
+ * @param startOffset   该epoch版本的Leader写入第一条消息的位移值
+ */
 case class EpochEntry(epoch: Int, startOffset: Long) {
   override def toString: String = {
     s"EpochEntry(epoch=$epoch, startOffset=$startOffset)"

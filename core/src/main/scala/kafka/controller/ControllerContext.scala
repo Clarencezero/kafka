@@ -131,16 +131,29 @@ class ControllerContext {
   // 集群中所有主题的名称
   var topicNames = mutable.Map.empty[Uuid, String]
 
-  // 分区的副本列表 <主题名称,<分区ID, 该分区所有副本详情>>
+  /**
+   * 管理整个集群的 主题、分区、副本等元数据信息
+   * <主题, Map<分区ID, 所有副本元数据详情>>
+   * 我们需要明确一点是，当对外提供服务时，最小粒度应该是「分区」
+   * 当从Broker管理角度而言，最小粒度是「副本」
+   */
   val partitionAssignments = mutable.Map.empty[String, mutable.Map[Int, ReplicaAssignment]]
 
-  // 分区的Leader/ISR副本信息 <分区, Leader副本、ISR集合、Controller版本号>
+  /**
+   * partitionLeadershipInfo：<分区, LeaderIsrAndControllerEpoch>
+   * LeaderIsrAndControllerEpoch：LeaderAndIsr + Controller Epoch
+   * 分区对应的 Leader、ISR副本的元数据详情
+   */
   private val partitionLeadershipInfo = mutable.Map.empty[TopicPartition, LeaderIsrAndControllerEpoch]
 
   // 集群正处于「分区重平衡」过程的主题分区列表
   val partitionsBeingReassigned = mutable.Set.empty[TopicPartition]
 
-  // 主题分区状态列表
+  /**
+   * 集群所有分区状态缓存
+   * <分区,分区状态>
+   * 分区状态包括：新分区、在线、离线、分区不存在
+   */
   val partitionStates = mutable.Map.empty[TopicPartition, PartitionState]
 
   // 主题分区的副本状态列表
@@ -234,8 +247,7 @@ class ControllerContext {
     // #2 更新缓存
     val previous = assignments.put(topicPartition.partition, newAssignment)
     val leadershipInfo = partitionLeadershipInfo.get(topicPartition)
-    updatePreferredReplicaImbalanceMetric(topicPartition, previous, leadershipInfo,
-      Some(newAssignment), leadershipInfo)
+    updatePreferredReplicaImbalanceMetric(topicPartition, previous, leadershipInfo, Some(newAssignment), leadershipInfo)
   }
 
   def partitionReplicaAssignmentForTopic(topic: String): Map[TopicPartition, Seq[Int]] = {
@@ -548,6 +560,12 @@ class ControllerContext {
       Some(replicaAssignment), Some(leaderIsrAndControllerEpoch))
   }
 
+  /**
+   * 获取某个分区的副本元数据信息
+   *
+   * @param partition
+   * @return
+   */
   def partitionLeadershipInfo(partition: TopicPartition): Option[LeaderIsrAndControllerEpoch] = {
     partitionLeadershipInfo.get(partition)
   }
@@ -559,7 +577,7 @@ class ControllerContext {
     partitionLeadershipInfo.keySet.filter(tp => !isTopicQueuedUpForDeletion(tp.topic))
 
   /**
-   *
+   * 获取集群中Leader副本离线的分区列表
    * @return
    */
   def partitionsWithOfflineLeader: Set[TopicPartition] = {
@@ -588,8 +606,8 @@ class ControllerContext {
   def partitionWithLeadersCount: Int = partitionLeadershipInfo.size
 
   /**
-   *
-   * @param partition
+   * 更新相关统计指标
+   * @param partition               分区
    * @param oldReplicaAssignment
    * @param oldLeadershipInfo
    * @param newReplicaAssignment

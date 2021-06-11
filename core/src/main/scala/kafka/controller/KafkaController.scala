@@ -825,7 +825,7 @@ class KafkaController(val config: KafkaConfig,
   }
 
   /**
-   * 该方法将给定的副本状态变更为离线状态。它做了以下工作
+   * 该将给定的副本的状态变更为「离线状态（Offline）」。它做了以下工作
    * ① 将给定的分区标记为「Offline」
    * ② 对所有new/offline分区触发OnlinePartition状态变化
    * ③ 在新的离线复制的输入列表上调用OfflineReplica状态变化
@@ -842,17 +842,23 @@ class KafkaController(val config: KafkaConfig,
    * partitions coming online.
    */
   private def onReplicasBecomeOffline(newOfflineReplicas: Set[PartitionAndReplica]): Unit = {
-    // #1 对「newOfflineReplicas」副本根据主题是否被删除做区分
+    // 以副本的主题是否被删除为依据划分为「主题已删除分区」和「主题未删除分区」
     val (newOfflineReplicasForDeletion, newOfflineReplicasNotForDeletion) =
       newOfflineReplicas.partition(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
 
+    // 获取集群中Leader副本离线的分区列表
     val partitionsWithOfflineLeader = controllerContext.partitionsWithOfflineLeader
 
-    // trigger OfflinePartition state for all partitions whose current leader is one amongst the newOfflineReplicas
+    // 分区状态机：将那些Leader副本离线的分区状态设置为「OfflinePartition」。
+    // 这一步仅是将缓存中的副本状态设置为「OfflinePartition」
     partitionStateMachine.handleStateChanges(partitionsWithOfflineLeader.toSeq, OfflinePartition)
-    // trigger OnlinePartition state changes for offline or new partitions
+
+    // 分区状态机：尝试将处于OfflinePartition和NewPartition状态的分区变更为「OnlinePartition」
+    // 1.触发Leader选举 2.更新或创建ZK节点 3.更新本地缓存 4.向其实Broker发送「LeaderAndIsr」请求
     partitionStateMachine.triggerOnlinePartitionStateChange()
     // trigger OfflineReplica state change for those newly offline replicas
+
+    // 副本状态机：更改由于Broker下线而导致离线副本的状态
     replicaStateMachine.handleStateChanges(newOfflineReplicasNotForDeletion.toSeq, OfflineReplica)
 
     // fail deletion of topics that are affected by the offline replicas

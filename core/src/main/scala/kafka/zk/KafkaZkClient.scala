@@ -261,6 +261,7 @@ class KafkaZkClient private[zk](zooKeeperClient: ZooKeeperClient, isSecure: Bool
   }
 
   /**
+   * 根据给定的分区元数据详情创建分区状态节点
    * Creates topic partition state znodes for the given partitions.
    *
    * @param leaderIsrAndControllerEpochs     the partition states of each partition whose state we wish to set.

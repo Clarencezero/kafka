@@ -110,11 +110,22 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
         }
     }
 
+    /**
+     *
+     * @param <T>
+     */
     public static final class PartitionData<T extends BaseRecords> {
         private final FetchResponseData.FetchablePartitionResponse partitionResponse;
 
-        // Derived fields
+        /**
+         * 期望的Read Replica
+         * Kafka2.4之后支持部分Follower副本可以对外提供读服务功能
+         */
         private final Optional<Integer> preferredReplica;
+
+        /**
+         * 该分区对应的已终止事务列表
+         */
         private final List<AbortedTransaction> abortedTransactions;
         private final Errors error;
 
@@ -137,6 +148,17 @@ public class FetchResponse<T extends BaseRecords> extends AbstractResponse {
             this.error = Errors.forCode(partitionResponse.errorCode());
         }
 
+        /**
+         *
+         * @param error                     错误码
+         * @param highWatermark             高水位值，决定消费者能拉取的最新消息的位移值
+         * @param lastStableOffset          LSO值，和事务相关，不能与logStartOffset混淆
+         * @param logStartOffset            最新的Log Start Offset，消息起始位置
+         * @param preferredReadReplica      期望的Read副本，用于指定可对外提供读服务的Follower副本
+         * @param abortedTransactions       该分区对应的已终止的事务列表
+         * @param divergingEpoch            用于follower截断操作
+         * @param records                   消息集合
+         */
         public PartitionData(Errors error,
                              long highWatermark,
                              long lastStableOffset,

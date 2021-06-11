@@ -144,6 +144,20 @@ case class LogReadResult(info: FetchDataInfo,
 
 }
 
+/**
+ * 与 {@link LogReadResult} 字段大体相同，而 {@link FetchPartitionData} 多出一个字段用于
+ * 区分是不是处于重分配中，如果是的话，则更新JXM的监控指标
+ *
+ * @param error
+ * @param highWatermark
+ * @param logStartOffset
+ * @param records
+ * @param divergingEpoch
+ * @param lastStableOffset
+ * @param abortedTransactions
+ * @param preferredReadReplica
+ * @param isReassignmentFetch
+ */
 case class FetchPartitionData(error: Errors = Errors.NONE,
                               highWatermark: Long,
                               logStartOffset: Long,
@@ -168,13 +182,18 @@ sealed trait HostedPartition
 sealed trait NonOffline extends HostedPartition {
   val partition: Partition
 }
+/**
+ * 定义具体的Broker本地保存分区的状态
+ */
 object HostedPartition {
   /**
    * This broker does not have any state for this partition locally.
+   * 本地没有任何关于此分区的状态
    */
   final object None extends HostedPartition
 
   /**
+   * 在线状态
    * This broker hosts the partition and it is online.
    */
   final case class Online(partition: Partition) extends NonOffline
@@ -189,6 +208,7 @@ object HostedPartition {
   final case class Deferred(partition: Partition, isNew: Boolean) extends NonOffline
 
   /**
+   * 离线状态
    * This broker hosts the partition, but it is in an offline log directory.
    */
   final object Offline extends HostedPartition
@@ -199,23 +219,28 @@ object ReplicaManager {
 }
 
 /**
- * 副本管理器：管理集群所有副本状态转换
+ * 副本管理器：负责管理和操作集群中Broker的副本对象，
+ * 另外还承担了一部分分区管理工作，比如变更整个分区的副本日志路径等。
  *
- * @param config
- * @param metrics
- * @param time
- * @param zkClient
- * @param scheduler
- * @param logManager
- * @param isShuttingDown
- * @param quotaManagers
- * @param brokerTopicStats
- * @param metadataCache
+ * {@link ReplicaManager} 类非常重要，它是Kafka构建副本同步机制的重要组件之一。
+ * 副本同步过程出现的问题大都比较难解决。
+ * 副本同步本质上是副本读取+副本写入。
+ *
+ * @param config                        配置管理类
+ * @param metrics                       监控指标类
+ * @param time                          定时器类
+ * @param zkClient                      Zookeeper客户端
+ * @param scheduler                     Kafka调度器
+ * @param logManager                    日志管理器
+ * @param isShuttingDown                是否已经关闭
+ * @param quotaManagers                 配额管理器（用于限流）
+ * @param brokerTopicStats              Broker主题监控指标类
+ * @param metadataCache                 Broker元数据缓存
  * @param logDirFailureChannel
- * @param delayedProducePurgatory
- * @param delayedFetchPurgatory
- * @param delayedDeleteRecordsPurgatory
- * @param delayedElectLeaderPurgatory
+ * @param delayedProducePurgatory       处理延迟「PRODUCER」请求的Purgatory
+ * @param delayedFetchPurgatory         处理延迟「FETCH」请求的Purgatory
+ * @param delayedDeleteRecordsPurgatory 处理延迟「DELETE_RECORDS」请求的Purgatory
+ * @param delayedElectLeaderPurgatory   处理延迟「ELECT_LEADERS」请求的Purgatory
  * @param threadNamePrefix
  * @param configRepository
  * @param alterIsrManager
@@ -270,12 +295,26 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   /* epoch of the controller that last changed the leader */
+  /**
+   * 隔离过期Controller发送的请求，Follewer不会接受老的Controller发送的请求。
+   * 如何区分就是通过controllerEpoch来做到的。
+   * 这个字段表示最新一次变更分区Leader的Controller的Epoch值，默认值：0。
+   * Controller每发生一次变更，该字段值都会+1
+   */
   @volatile private[server] var controllerEpoch: Int = KafkaController.InitialControllerEpoch
   protected val localBrokerId = config.brokerId
+  /**
+   * 保存Broker上所有分区对象的数据
+   * allPartitions 会将所有分区对象初始化成「Online」状态
+   */
   protected val allPartitions = new Pool[TopicPartition, HostedPartition](
     valueFactory = Some(tp => HostedPartition.Online(Partition(tp, time, configRepository, this)))
   )
   protected val replicaStateChangeLock = new Object
+
+  /**
+   * ReplicaManager类利用replicateFetcherManager管理所有Fetcher线程的生命周期，包括创建、启动、添加、停止和移除等。
+   */
   val replicaFetcherManager = createReplicaFetcherManager(metrics, time, threadNamePrefix, quotaManagers.follower)
   private[server] val replicaAlterLogDirsManager = createReplicaAlterLogDirsManager(quotaManagers.alterLogDirs, brokerTopicStats)
   private val highWatermarkCheckPointThreadStarted = new AtomicBoolean(false)
@@ -616,6 +655,14 @@ class ReplicaManager(val config: KafkaConfig,
   def tryCompleteActions(): Unit = actionQueue.tryCompleteActions()
 
   /**
+   * 向副本底层日志文件追加消息。
+   * 写入文件有以下4大类：
+   * ① 生产者向Leader本地文件写入消息。
+   * ② Follower副本从Leader拉取消息后写入本地副本文件。
+   * ③ 消费者组写入组信息
+   * ④ 事务管理器写入事务信息（包括事务标记、事务元数据等）
+   * 除了②之外，其他都是调用 {@link #appendRecords} 方法来实现的。
+   *
    * Append messages to leader replicas of the partition, and wait for them to be replicated to other replicas;
    * the callback function will be triggered either when timeout or the required acks are satisfied;
    * if the callback function itself is already synchronized on some object then pass this object to avoid deadlock.
@@ -623,6 +670,20 @@ class ReplicaManager(val config: KafkaConfig,
    * Noted that all pending delayed check operations are stored in a queue. All callers to ReplicaManager.appendRecords()
    * are expected to call ActionQueue.tryCompleteActions for all affected partitions, without holding any conflicting
    * locks.
+   *
+   * @param timeout                       请求处理超时时间
+   * @param requiredAcks                  请求ACKS的设置值
+   * @param internalTopicsAllowed         是否允许写入内部主题，对于普通的生产者而言，该字段为false，即不允许写入内部主题。
+   *                                      对于Coordinator组件，特别是消费者组GroupCoordinator来说，该值为true
+   * @param origin                        写入方来源。定义了3种写入方：
+   *                                      ①Replication：写本地文件请求是由Follower副本发出，它要将从Leader副本获得的消息记录写入到本地日志文件中。
+   *                                      ②Coordinator：写本地文件请求是由Coordinator发起，既可以是管理消费者组的GroupCoordinator，也可以是管理
+   *                                      事务的TransactionCoordinator。
+   *                                      ③Client：写本地文件请求是由客户端发起，
+   * @param entriesPerPartition           待写入消息。以分区为key进行分组，value则对应该分区的消息集合。
+   * @param responseCallback              回调。写入成功后将要触发的回调方法
+   * @param delayedProduceLock            专门用来保护消费者组操作线程安全的锁对象
+   * @param recordConversionStatsCallback 用于统计消息格式转换操作过程中的一些数据结构：比如转换消息条数、花费时间等
    */
   def appendRecords(timeout: Long,
                     requiredAcks: Short,
@@ -632,15 +693,18 @@ class ReplicaManager(val config: KafkaConfig,
                     responseCallback: Map[TopicPartition, PartitionResponse] => Unit,
                     delayedProduceLock: Option[Lock] = None,
                     recordConversionStatsCallback: Map[TopicPartition, RecordConversionStats] => Unit = _ => ()): Unit = {
+    // #1 校验ACKS的值是否合法（-1,0,1）
     if (isValidRequiredAcks(requiredAcks)) {
       val sTime = time.milliseconds
+      // #2 将日志记录写入本地文件中
       val localProduceResults = appendToLocalLog(internalTopicsAllowed = internalTopicsAllowed,
         origin, entriesPerPartition, requiredAcks)
       debug("Produce to local log in %d ms".format(time.milliseconds - sTime))
 
       val produceStatus = localProduceResults.map { case (topicPartition, result) =>
         topicPartition -> ProducePartitionStatus(
-          result.info.lastOffset + 1, // required offset
+          result.info.lastOffset + 1, // 设置下一条待写入消息的位移值
+          // 构建PartitionResponse封装写入结果
           new PartitionResponse(
             result.error,
             result.info.firstOffset.map(_.messageOffset).getOrElse(-1),
@@ -671,12 +735,15 @@ class ReplicaManager(val config: KafkaConfig,
               }
           }
       }
-
+      // 尝试更新消息格式转换的指标数据
       recordConversionStatsCallback(localProduceResults.map { case (k, v) => k -> v.info.recordConversionStats })
 
+      // 需要等待其它副本完成写入
       if (delayedProduceRequestRequired(requiredAcks, entriesPerPartition, localProduceResults)) {
         // create delayed produce operation
         val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
+
+        // 创建DelayedProducer延迟请求对象
         val delayedProduce = new DelayedProduce(timeout, produceMetadata, this, responseCallback, delayedProduceLock)
 
         // create a list of (topic, partition) pairs to use as keys for this delayed produce operation
@@ -685,10 +752,12 @@ class ReplicaManager(val config: KafkaConfig,
         // try to complete the request immediately, otherwise put it into the purgatory
         // this is because while the delayed produce operation is being created, new
         // requests may arrive and hence make this operation completable.
+        // 再次尝试完成该延迟请求，如果暂时无法完成，则将对象放入到相应的Purgatory中等待后续处理
         delayedProducePurgatory.tryCompleteElseWatch(delayedProduce, producerRequestKeys)
 
       } else {
         // we can respond immediately
+        // 触发回调逻辑
         val produceResponseStatus = produceStatus.map { case (k, status) => k -> status.responseStatus }
         responseCallback(produceResponseStatus)
       }
@@ -703,6 +772,7 @@ class ReplicaManager(val config: KafkaConfig,
           LogAppendInfo.UnknownLogAppendInfo.logStartOffset
         )
       }
+      // 构造「INVALID_REQUIRED_ACKS」异常并封装进回调函数调用中
       responseCallback(responseStatus)
     }
   }
@@ -1332,7 +1402,15 @@ class ReplicaManager(val config: KafkaConfig,
       }
     }
   }
-
+  /**
+   * {@link LeaderAndIsrRequest} 请求是由Controller发送给Broker，告知Broker哪些Leader在你这里，哪些Follower副本在你这里。
+   * Leader副本+Follower副本=Broker管理的所有副本集合
+   *
+   * @param correlationId
+   * @param leaderAndIsrRequest
+   * @param onLeadershipChange
+   * @return
+   */
   def becomeLeaderOrFollower(correlationId: Int,
                              leaderAndIsrRequest: LeaderAndIsrRequest,
                              onLeadershipChange: (Iterable[Partition], Iterable[Partition]) => Unit): LeaderAndIsrResponse = {
@@ -1351,34 +1429,43 @@ class ReplicaManager(val config: KafkaConfig,
       val topicIds = leaderAndIsrRequest.topicIds()
 
       val response = {
+        // 缓存的ControllerEpoch大于Controller发送的，表示这是一个延迟的请求，抛出异常即可
         if (leaderAndIsrRequest.controllerEpoch < controllerEpoch) {
           stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from controller $controllerId with " +
             s"correlation id $correlationId since its controller epoch ${leaderAndIsrRequest.controllerEpoch} is old. " +
             s"Latest known controller epoch is $controllerEpoch")
           leaderAndIsrRequest.getErrorResponse(0, Errors.STALE_CONTROLLER_EPOCH.exception)
         } else {
+          // 更新当前的Controlelr Epoch值
           val responseMap = new mutable.HashMap[TopicPartition, Errors]
           controllerEpoch = leaderAndIsrRequest.controllerEpoch
 
           val partitionStates = new mutable.HashMap[Partition, LeaderAndIsrPartitionState]()
 
+          // 遍历「LeaderAndIsrRequest」所有分区
           // First create the partition if it doesn't exist already
           requestPartitionStates.foreach { partitionState =>
             val topicPartition = new TopicPartition(partitionState.topicName, partitionState.partitionIndex)
+            // 从「allPartitions」中获取对应的分区对象，里面包含分区对象的状态
             val partitionOpt = getPartition(topicPartition) match {
               case HostedPartition.Offline =>
-                stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from " +
+                // 分区为「Offline」离线状态
+              stateChangeLogger.warn(s"Ignoring LeaderAndIsr request from " +
                   s"controller $controllerId with correlation id $correlationId " +
                   s"epoch $controllerEpoch for partition $topicPartition as the local replica for the " +
                   "partition is in an offline log directory")
+                // 添加对象异常到「responseMap」中
                 responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
                 None
 
               case _: HostedPartition.Deferred =>
-                throw new IllegalStateException("We should never be deferring partition metadata changes and becoming a leader or follower when using ZooKeeper")
+                // 分区为「Online」状态，直接赋值partitionOpt即可
+              throw new IllegalStateException("We should never be deferring partition metadata changes and becoming a leader or follower when using ZooKeeper")
 
               case HostedPartition.Online(partition) =>
-                Some(partition)
+                // 分区为「None」状态，表示没有找到，那么创建新的分区对象并加入「allPartitions」集合中统一管理
+                // 然后再赋值partitionOpt即可
+              Some(partition)
 
               case HostedPartition.None =>
                 val partition = Partition(topicPartition, time, configRepository, this)
@@ -1456,10 +1543,13 @@ class ReplicaManager(val config: KafkaConfig,
 
           // we initialize highwatermark thread after the first leaderisrrequest. This ensures that all the partitions
           // have been completely populated before starting the checkpointing there by avoiding weird race conditions
+          // 启用高水位检查点专属线程：定期将Broker上所有非Offline分区的高水位值写入到检查点文件中
           startHighWatermarkCheckPointThread()
 
+          // 添加日志路径数据迁移线程
           maybeAddLogDirFetchers(partitionStates.keySet, highWatermarkCheckpoints)
 
+          // 关闭空闲副本拉取线程
           replicaFetcherManager.shutdownIdleFetcherThreads()
           replicaAlterLogDirsManager.shutdownIdleFetcherThreads()
           onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
