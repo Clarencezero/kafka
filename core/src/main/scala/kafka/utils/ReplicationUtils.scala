@@ -24,6 +24,14 @@ import org.apache.kafka.common.TopicPartition
 
 object ReplicationUtils extends Logging {
 
+  /**
+   * 更新zookeeper节点状态 /brokers/topics/<topicName>/partitions/<partition index>/state
+   * @param zkClient
+   * @param partition
+   * @param newLeaderAndIsr
+   * @param controllerEpoch
+   * @return
+   */
   def updateLeaderAndIsr(zkClient: KafkaZkClient, partition: TopicPartition, newLeaderAndIsr: LeaderAndIsr,
                          controllerEpoch: Int): (Boolean, Int) = {
     debug(s"Updated ISR for $partition to ${newLeaderAndIsr.isr.mkString(",")}")

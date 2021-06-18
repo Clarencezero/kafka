@@ -84,7 +84,14 @@ public class FindCoordinatorRequest extends AbstractRequest {
     }
 
     public enum CoordinatorType {
-        GROUP((byte) 0), TRANSACTION((byte) 1);
+        /**
+         * 消费者组协调器找寻请求
+         */
+        GROUP((byte) 0),
+        /**
+         * 事务协调器找寻请求
+         */
+        TRANSACTION((byte) 1);
 
         final byte id;
 

@@ -18,17 +18,24 @@ package org.apache.kafka.common.utils;
 
 import org.apache.kafka.common.record.RecordBatch;
 
+/**
+ * POJO 类，存储Producer ID 和版本号
+ */
 public class ProducerIdAndEpoch {
     public static final ProducerIdAndEpoch NONE = new ProducerIdAndEpoch(RecordBatch.NO_PRODUCER_ID, RecordBatch.NO_PRODUCER_EPOCH);
 
-    public final long producerId;
-    public final short epoch;
+    public final long producerId; // PID
+    public final short epoch;     // 版本号
 
     public ProducerIdAndEpoch(long producerId, short epoch) {
         this.producerId = producerId;
         this.epoch = epoch;
     }
 
+    /**
+     * 如果 PID>-1，则合法，否则非法
+     * @return
+     */
     public boolean isValid() {
         return RecordBatch.NO_PRODUCER_ID < producerId;
     }

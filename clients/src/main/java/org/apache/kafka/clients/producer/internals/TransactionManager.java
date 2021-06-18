@@ -23,6 +23,7 @@ import org.apache.kafka.clients.RequestCompletionHandler;
 import org.apache.kafka.clients.consumer.CommitFailedException;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.errors.InvalidPidMappingException;
 import org.apache.kafka.common.errors.InvalidProducerEpochException;
 import org.apache.kafka.common.errors.RetriableException;
@@ -99,6 +100,9 @@ public class TransactionManager {
     private final ApiVersions apiVersions;
     private final boolean autoDowngradeTxnCommit;
 
+    /**
+     * 缓存分区事务/幂等相关的元数据，比如批次、偏移量、PID等
+     */
     private static class TopicPartitionBookkeeper {
 
         private final Map<TopicPartition, TopicPartitionEntry> topicPartitions = new HashMap<>();
@@ -161,26 +165,41 @@ public class TransactionManager {
         }
     }
 
+    /**
+     * 用于跟踪某个分区的批次发送请求
+     */
     private static class TopicPartitionEntry {
 
-        // The producer id/epoch being used for a given partition.
+        /**
+         * 给定分区的PID和Epoch
+         */
         private ProducerIdAndEpoch producerIdAndEpoch;
 
-        // The base sequence of the next batch bound for a given partition.
+        /**
+         * 给定分区的下一个批次序列号Sequence Number
+         */
         private int nextSequence;
 
-        // The sequence number of the last record of the last ack'd batch from the given partition. When there are no
-        // in flight requests for a partition, the lastAckedSequence(topicPartition) == nextSequence(topicPartition) - 1.
+        /**
+         * 最新收到ACK确认的序列号
+         * 来自给定分区的最后一个确认批次的最后一个记录的序列号。
+         * 当「in-flight」没有该分区的请求时，lastAckedSequence(topicPartition) == nextSequence(topicPartition) - 1。
+         */
         private int lastAckedSequence;
 
-        // Keep track of the in flight batches bound for a partition, ordered by sequence. This helps us to ensure that
-        // we continue to order batches by the sequence numbers even when the responses come back out of order during
-        // leader failover. We add a batch to the queue when it is drained, and remove it when the batch completes
-        // (either successfully or through a fatal failure).
+        /**
+         * 一个排序集合。
+         * 跟踪绑定到分区的「in-flight」批次，并按顺序排序。
+         * 这有助于确保我们继续按序列号对批次进行排序，即使在leader副本故障转移期间响应乱序也是可以满足批次顺序性。
+         * 当我们调用 {@link RecordAccumulator#drain(Cluster, Set, int, long)}方法时将批次添加到事务管理器的队列中，
+         * 然后当批次完成（成功或抛出fatal异常）时将其移除
+         */
         private SortedSet<ProducerBatch> inflightBatchesBySequence;
 
-        // We keep track of the last acknowledged offset on a per partition basis in order to disambiguate UnknownProducer
-        // responses which are due to the retention period elapsing, and those which are due to actual lost data.
+        /**
+         * 我们追踪每个分区的最新的ACK的位移值，以便区分由于保留期过期而产生的未知生产者响应和由于实际丢失数据而产生的响应。
+         * lastOffset = response.baseOffset + batch.recordCount - 1;
+         */
         private long lastAckedOffset;
 
         TopicPartitionEntry() {
@@ -205,15 +224,15 @@ public class TransactionManager {
 
     private final Map<TopicPartition, CommittedOffset> pendingTxnOffsetCommits;
 
-    // If a batch bound for a partition expired locally after being sent at least once, the partition has is considered
-    // to have an unresolved state. We keep track fo such partitions here, and cannot assign any more sequence numbers
-    // for this partition until the unresolved state gets cleared. This may happen if other inflight batches returned
-    // successfully (indicating that the expired batch actually made it to the broker). If we don't get any successful
-    // responses for the partition once the inflight request count falls to zero, we reset the producer id and
-    // consequently clear this data structure as well.
-    // The value of the map is the sequence number of the batch following the expired one, computed by adding its
-    // record count to its sequence number. This is used to tell if a subsequent batch is the one immediately following
-    // the expired one.
+    /**
+     * 分区未解决的序列号。
+     * 如果一个分区的一个批次在至少发送一次后过期了（expired），那么这个分区就会被认为是「unresolved」状态。
+     * 我们在这里跟踪这类分区，以保证在未解决该分区Unsolved之前是不会分配更多的Sequence Number。
+     *
+     * 可能出现其它「in-flight」批次成功返回（表示过期的批次实际上Broker已经接收，可能由于网络原因造成ACK无法收到响应）。
+     * 如果一旦「in-flight」数量下降到0，并且我们没有收到任何分区成功的响应，我们就会重置PID，并且也会清空这个数据结构。
+     * 这个字段的value是过期批次的最后的序列号+1。该值用作判断后续批次是否是紧随过期批次的批次。
+     */
     private final Map<TopicPartition, Integer> partitionsWithUnresolvedSequences;
 
     // The partitions that have received an error that triggers an epoch bump. When the epoch is bumped, these
@@ -246,14 +265,25 @@ public class TransactionManager {
     private volatile boolean transactionStarted = false;
     private volatile boolean epochBumpRequired = false;
 
+    /**
+     * Producer的 {@link TransactionManager} 类的状态
+     */
     private enum State {
+        // 未初始化
         UNINITIALIZED,
+        // 正在初始化
         INITIALIZING,
+        // 准备提供服务
         READY,
+        // 处于事务中
         IN_TRANSACTION,
+        // 正在提交事务
         COMMITTING_TRANSACTION,
+        // 事务正在回滚
         ABORTING_TRANSACTION,
+        // 回滚错误
         ABORTABLE_ERROR,
+        // 致命错误
         FATAL_ERROR;
 
         private boolean isTransitionValid(State source, State target) {
@@ -412,11 +442,11 @@ public class TransactionManager {
 
         log.debug("Begin adding offsets {} for consumer group {} to transaction", offsets, groupMetadata);
         AddOffsetsToTxnRequest.Builder builder = new AddOffsetsToTxnRequest.Builder(
-            new AddOffsetsToTxnRequestData()
-                .setTransactionalId(transactionalId)
-                .setProducerId(producerIdAndEpoch.producerId)
-                .setProducerEpoch(producerIdAndEpoch.epoch)
-                .setGroupId(groupMetadata.groupId())
+                new AddOffsetsToTxnRequestData()
+                        .setTransactionalId(transactionalId)
+                        .setProducerId(producerIdAndEpoch.producerId)
+                        .setProducerEpoch(producerIdAndEpoch.epoch)
+                        .setGroupId(groupMetadata.groupId())
         );
         AddOffsetsToTxnHandler handler = new AddOffsetsToTxnHandler(builder, offsets, groupMetadata);
 
@@ -452,9 +482,17 @@ public class TransactionManager {
         }
     }
 
+    /**
+     * 判断是否允许向该分区发送数据
+     *
+     * @param tp 待判断的分区详情
+     * @return
+     */
     synchronized boolean isSendToPartitionAllowed(TopicPartition tp) {
+        // 如果当前事务管理器出现致命异常，则不允许
         if (hasFatalError())
             return false;
+        // 如果是非事务或者分区处于事务中，则返回true
         return !isTransactional() || partitionsInTransaction.contains(tp);
     }
 
@@ -526,13 +564,18 @@ public class TransactionManager {
         return producerIdAndEpoch;
     }
 
+    /**
+     * 如果存在PID和epoch冲突，那么就重置Sequence number，从0开始，并且更新PID和epoch
+     *
+     * @param topicPartition 分区
+     */
     synchronized public void maybeUpdateProducerIdAndEpoch(TopicPartition topicPartition) {
         if (hasStaleProducerIdAndEpoch(topicPartition) && !hasInflightBatches(topicPartition)) {
-            // If the batch was on a different ID and/or epoch (due to an epoch bump) and all its in-flight batches
-            // have completed, reset the partition sequence so that the next batch (with the new epoch) starts from 0
+            // 如果有批次处于不同的PID或epoch（因为出现epoch冲突(bump)）并且其所有正在进行的次都已收到响应，那就重置分区序列号（sequence numbers）
+            // 以便下一个批次从0开始，当前，它也有新的epoch值。
             topicPartitionBookkeeper.startSequencesAtBeginning(topicPartition, this.producerIdAndEpoch);
             log.debug("ProducerId of partition {} set to {} with epoch {}. Reinitialize sequence at beginning.",
-                      topicPartition, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch);
+                    topicPartition, producerIdAndEpoch.producerId, producerIdAndEpoch.epoch);
         }
     }
 
@@ -591,11 +634,15 @@ public class TransactionManager {
         epochBumpRequired = false;
     }
 
+    /**
+     *
+     */
     synchronized void bumpIdempotentEpochAndResetIdIfNeeded() {
         if (!isTransactional()) {
             if (epochBumpRequired) {
                 bumpIdempotentProducerEpoch();
             }
+            // 状态不为INITIALIZING且没有Producer ID，那么就需要发送「InitProducerId」请求以获取PID
             if (currentState != State.INITIALIZING && !hasProducerId()) {
                 transitionTo(State.INITIALIZING);
                 InitProducerIdRequestData requestData = new InitProducerIdRequestData()
@@ -608,9 +655,13 @@ public class TransactionManager {
     }
 
     /**
-     * Returns the next sequence number to be written to the given TopicPartition.
+     * 返回给定分区的下一个序列号，Kafka使用PID+Sequence number保证单个分区的EOS语义
+     *
+     * @param topicPartition 分区
+     * @return
      */
     synchronized Integer sequenceNumber(TopicPartition topicPartition) {
+        // 从缓存中获取
         return topicPartitionBookkeeper.getOrCreatePartition(topicPartition).nextSequence;
     }
 
@@ -637,9 +688,10 @@ public class TransactionManager {
     /**
      * Returns the first inflight sequence for a given partition. This is the base sequence of an inflight batch with
      * the lowest sequence number.
+     *
      * @return the lowest inflight sequence if the transaction manager is tracking inflight requests for this partition.
-     *         If there are no inflight requests being tracked for this partition, this method will return
-     *         RecordBatch.NO_SEQUENCE.
+     * If there are no inflight requests being tracked for this partition, this method will return
+     * RecordBatch.NO_SEQUENCE.
      */
     synchronized int firstInFlightSequence(TopicPartition topicPartition) {
         if (!hasInflightBatches(topicPartition))
@@ -793,10 +845,22 @@ public class TransactionManager {
         });
     }
 
+    /**
+     * 判断当前分区的「in-flight」是否存在数据，如果存在则返回true，否则返回false
+     *
+     * @param topicPartition 待校验的分区详情
+     * @return
+     */
     synchronized boolean hasInflightBatches(TopicPartition topicPartition) {
         return !topicPartitionBookkeeper.getOrCreatePartition(topicPartition).inflightBatchesBySequence.isEmpty();
     }
 
+    /**
+     * 拥有旧的PID和Epoch值
+     *
+     * @param topicPartition 分区
+     * @return
+     */
     synchronized boolean hasStaleProducerIdAndEpoch(TopicPartition topicPartition) {
         return !producerIdAndEpoch.equals(topicPartitionBookkeeper.getOrCreatePartition(topicPartition).producerIdAndEpoch);
     }
@@ -809,16 +873,25 @@ public class TransactionManager {
         return partitionsWithUnresolvedSequences.containsKey(topicPartition);
     }
 
+    /**
+     * 将该批次标记为Unresolved
+     *
+     *
+     * @param batch 待标记的批次
+     */
     synchronized void markSequenceUnresolved(ProducerBatch batch) {
         int nextSequence = batch.lastSequence() + 1;
         partitionsWithUnresolvedSequences.compute(batch.topicPartition,
-            (k, v) -> v == null ? nextSequence : Math.max(v, nextSequence));
-        log.debug("Marking partition {} unresolved with next sequence number {}", batch.topicPartition,
-                partitionsWithUnresolvedSequences.get(batch.topicPartition));
+                (k, v) -> v == null ? nextSequence : Math.max(v, nextSequence));
+        log.debug("Marking partition {} unresolved with next sequence number {}", batch.topicPartition, partitionsWithUnresolvedSequences.get(batch.topicPartition));
     }
 
     // Attempts to resolve unresolved sequences. If all in-flight requests are complete and some partitions are still
     // unresolved, either bump the epoch if possible, or transition to a fatal error
+
+    /**
+     *
+     */
     synchronized void maybeResolveSequences() {
         for (Iterator<TopicPartition> iter = partitionsWithUnresolvedSequences.keySet().iterator(); iter.hasNext(); ) {
             TopicPartition topicPartition = iter.next();
@@ -1029,12 +1102,16 @@ public class TransactionManager {
                 return true;
             }
         } else if (error == Errors.OUT_OF_ORDER_SEQUENCE_NUMBER) {
+            // 收到Broker的乱序
             if (!hasUnresolvedSequence(batch.topicPartition) &&
                     (batch.sequenceHasBeenReset() || !isNextSequence(batch.topicPartition, batch.baseSequence()))) {
                 // We should retry the OutOfOrderSequenceException if the batch is _not_ the next batch, ie. its base
                 // sequence isn't the lastAckedSequence + 1.
                 return true;
             } else if (!isTransactional()) {
+                // 对于幂等Producer而言，对OUT_OF_ORDER_SEQUENCE_NUMBER错误都会重试。如果不存在没有解析的序列，或者这个
+                // 批次是紧挨着未解析序列之后的序列，我们知道序列中实际上存在间隙，并且epoch也会存在冲突。因此，在没有冲突的情况下
+                // 重试并等待序列是否解决
                 // For the idempotent producer, retry all OUT_OF_ORDER_SEQUENCE_NUMBER errors. If there are no
                 // unresolved sequences, or this batch is the one immediately following an unresolved sequence, we know
                 // there is actually a gap in the sequences, and we bump the epoch. Otherwise, retry without bumping
@@ -1073,7 +1150,7 @@ public class TransactionManager {
 
     private void transitionTo(State target, RuntimeException error) {
         if (!currentState.isTransitionValid(currentState, target)) {
-            String idString = transactionalId == null ?  "" : "TransactionalId " + transactionalId + ": ";
+            String idString = transactionalId == null ? "" : "TransactionalId " + transactionalId + ": ";
             throw new KafkaException(idString + "Invalid transition attempted from state "
                     + currentState.name() + " to state " + target.name());
         }
@@ -1105,7 +1182,7 @@ public class TransactionManager {
             // but create a new instance without the call trace since it was not thrown because of the current call
             if (lastError instanceof ProducerFencedException) {
                 throw new ProducerFencedException("The producer has been rejected from the broker because " +
-                    "it tried to use an old epoch with the transactionalId");
+                        "it tried to use an old epoch with the transactionalId");
             } else if (lastError instanceof InvalidProducerEpochException) {
                 throw new InvalidProducerEpochException("Producer attempted to produce with an old epoch " + producerIdAndEpoch);
             } else {
@@ -1145,8 +1222,8 @@ public class TransactionManager {
 
         FindCoordinatorRequest.Builder builder = new FindCoordinatorRequest.Builder(
                 new FindCoordinatorRequestData()
-                    .setKeyType(type.id())
-                    .setKey(coordinatorKey));
+                        .setKeyType(type.id())
+                        .setKey(coordinatorKey));
         enqueueRequest(new FindCoordinatorHandler(builder));
     }
 
@@ -1154,10 +1231,10 @@ public class TransactionManager {
         pendingPartitionsInTransaction.addAll(newPartitionsInTransaction);
         newPartitionsInTransaction.clear();
         AddPartitionsToTxnRequest.Builder builder =
-            new AddPartitionsToTxnRequest.Builder(transactionalId,
-                producerIdAndEpoch.producerId,
-                producerIdAndEpoch.epoch,
-                new ArrayList<>(pendingPartitionsInTransaction));
+                new AddPartitionsToTxnRequest.Builder(transactionalId,
+                        producerIdAndEpoch.producerId,
+                        producerIdAndEpoch.epoch,
+                        new ArrayList<>(pendingPartitionsInTransaction));
         return new AddPartitionsToTxnHandler(builder);
     }
 
@@ -1172,16 +1249,16 @@ public class TransactionManager {
         }
 
         final TxnOffsetCommitRequest.Builder builder =
-            new TxnOffsetCommitRequest.Builder(transactionalId,
-                groupMetadata.groupId(),
-                producerIdAndEpoch.producerId,
-                producerIdAndEpoch.epoch,
-                pendingTxnOffsetCommits,
-                groupMetadata.memberId(),
-                groupMetadata.generationId(),
-                groupMetadata.groupInstanceId(),
-                autoDowngradeTxnCommit
-            );
+                new TxnOffsetCommitRequest.Builder(transactionalId,
+                        groupMetadata.groupId(),
+                        producerIdAndEpoch.producerId,
+                        producerIdAndEpoch.epoch,
+                        pendingTxnOffsetCommits,
+                        groupMetadata.memberId(),
+                        groupMetadata.generationId(),
+                        groupMetadata.groupInstanceId(),
+                        autoDowngradeTxnCommit
+                );
         return new TxnOffsetCommitHandler(result, builder);
     }
 
@@ -1551,7 +1628,7 @@ public class TransactionManager {
                 abortableError(GroupAuthorizationException.forGroupId(builder.data().key()));
             } else {
                 fatalError(new KafkaException(String.format("Could not find a coordinator with type %s with key %s due to " +
-                        "unexpected error: %s", coordinatorType, builder.data().key(),
+                                "unexpected error: %s", coordinatorType, builder.data().key(),
                         findCoordinatorResponse.data().errorMessage())));
             }
         }
@@ -1729,7 +1806,7 @@ public class TransactionManager {
                 } else if (error == Errors.UNKNOWN_MEMBER_ID
                         || error == Errors.ILLEGAL_GENERATION) {
                     abortableError(new CommitFailedException("Transaction offset Commit failed " +
-                        "due to consumer group metadata mismatch: " + error.exception().getMessage()));
+                            "due to consumer group metadata mismatch: " + error.exception().getMessage()));
                     break;
                 } else if (isFatalException(error)) {
                     fatalError(error.exception());
@@ -1753,8 +1830,8 @@ public class TransactionManager {
 
     private boolean isFatalException(Errors error) {
         return error == Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED
-                   || error == Errors.INVALID_PRODUCER_EPOCH
-                   || error == Errors.PRODUCER_FENCED
-                   || error == Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT;
+                || error == Errors.INVALID_PRODUCER_EPOCH
+                || error == Errors.PRODUCER_FENCED
+                || error == Errors.UNSUPPORTED_FOR_MESSAGE_FORMAT;
     }
 }

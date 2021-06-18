@@ -60,6 +60,13 @@ object ProducerIdManager extends Logging {
   }
 }
 
+/**
+ * POJO类，承载Zookeeper节点 /latest_producer_id_block
+ * {"version":1,"broker":5,"block_start":"15000","block_end":"15999"}
+ * @param brokerId      申请的BrokerID
+ * @param blockStartId  起始序号
+ * @param blockEndId    终止序号
+ */
 case class ProducerIdBlock(brokerId: Int, blockStartId: Long, blockEndId: Long) {
   override def toString: String = {
     val producerIdBlockInfo = new StringBuilder
@@ -88,37 +95,47 @@ class ProducerIdManager(val brokerId: Int, val zkClient: KafkaZkClient) extends 
     nextProducerId = currentProducerIdBlock.blockStartId
   }
 
+  /**
+   * 尝试向Zookeeper节点写入数据，直到写入成功后返回
+   */
   private def getNewProducerIdBlock(): Unit = {
     var zkWriteComplete = false
     while (!zkWriteComplete) {
-      // refresh current producerId block from zookeeper again
+      // 获取 /latest_producer_id_block 节点数据
+      // {"version":1,"broker":5,"block_start":"15000","block_end":"15999"}
       val (dataOpt, zkVersion) = zkClient.getDataAndVersion(ProducerIdBlockZNode.path)
 
       // generate the new producerId block
       currentProducerIdBlock = dataOpt match {
         case Some(data) =>
+          // 解析数据
           val currProducerIdBlock = ProducerIdManager.parseProducerIdBlockData(data)
           debug(s"Read current producerId block $currProducerIdBlock, Zk path version $zkVersion")
 
+          // 如果超出最大值，则抛出异常
           if (currProducerIdBlock.blockEndId > Long.MaxValue - ProducerIdManager.PidBlockSize) {
             // we have exhausted all producerIds (wow!), treat it as a fatal error
             fatal(s"Exhausted all producerIds as the next block's end producerId is will has exceeded long type limit (current block end producerId is ${currProducerIdBlock.blockEndId})")
             throw new KafkaException("Have exhausted all producerIds.")
           }
 
+          // 生成下一批次的请求体/latest_producer_id_block节点中
           ProducerIdBlock(brokerId, currProducerIdBlock.blockEndId + 1L, currProducerIdBlock.blockEndId + ProducerIdManager.PidBlockSize)
         case None =>
           debug(s"There is no producerId block yet (Zk path version $zkVersion), creating the first block")
           ProducerIdBlock(brokerId, 0L, ProducerIdManager.PidBlockSize - 1)
       }
 
+      // 生成新的JSON，这些数据将会存储到
       val newProducerIdBlockData = ProducerIdManager.generateProducerIdBlockJson(currentProducerIdBlock)
 
-      // try to write the new producerId block into zookeeper
+      // 尝试将数据写入节点，有可能写入失败，如果写入失败，那么重试，直到写入成功为止
       val (succeeded, version) = zkClient.conditionalUpdatePath(ProducerIdBlockZNode.path,
-        newProducerIdBlockData, zkVersion, Some(checkProducerIdBlockZkData))
-      zkWriteComplete = succeeded
+        newProducerIdBlockData,
+        zkVersion,
+        Some(checkProducerIdBlockZkData))
 
+      zkWriteComplete = succeeded
       if (zkWriteComplete)
         info(s"Acquired new producerId block $currentProducerIdBlock by writing to Zk with path version $version")
     }

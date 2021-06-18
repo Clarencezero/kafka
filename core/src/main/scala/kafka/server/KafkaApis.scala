@@ -203,12 +203,12 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.OFFSET_COMMIT => handleOffsetCommitRequest(request)
         case ApiKeys.OFFSET_FETCH => handleOffsetFetchRequest(request)
         case ApiKeys.FIND_COORDINATOR => handleFindCoordinatorRequest(request)
+        // 处理JOIN Group 请求
         case ApiKeys.JOIN_GROUP => handleJoinGroupRequest(request)
         case ApiKeys.HEARTBEAT => handleHeartbeatRequest(request)
         case ApiKeys.LEAVE_GROUP => handleLeaveGroupRequest(request)
         case ApiKeys.SYNC_GROUP => handleSyncGroupRequest(request)
         case ApiKeys.DESCRIBE_GROUPS => handleDescribeGroupRequest(request)
-
         // 列举Groups
         case ApiKeys.LIST_GROUPS => handleListGroupsRequest(request)
         case ApiKeys.SASL_HANDSHAKE => handleSaslHandshakeRequest(request)
@@ -216,6 +216,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         case ApiKeys.CREATE_TOPICS => maybeForwardToController(request, handleCreateTopicsRequest)
         case ApiKeys.DELETE_TOPICS => maybeForwardToController(request, handleDeleteTopicsRequest)
         case ApiKeys.DELETE_RECORDS => handleDeleteRecordsRequest(request)
+        // 初始化Producer ID
         case ApiKeys.INIT_PRODUCER_ID => handleInitProducerIdRequest(request)
         case ApiKeys.OFFSET_FOR_LEADER_EPOCH => handleOffsetForLeaderEpochRequest(request)
         case ApiKeys.ADD_PARTITIONS_TO_TXN => handleAddPartitionToTxnRequest(request)
@@ -271,6 +272,11 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  /**
+   * 处理「LeaderAndIsr」请求
+   *
+   * @param request
+   */
   def handleLeaderAndIsrRequest(request: RequestChannel.Request): Unit = {
     val zkSupport = metadataSupport.requireZkOrThrow(KafkaApis.shouldNeverReceive(request))
     // ensureTopicExists is only for client facing requests
@@ -287,6 +293,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         s"${leaderAndIsrRequest.brokerEpoch} smaller than the current broker epoch ${zkSupport.controller.brokerEpoch}")
       requestHelper.sendResponseExemptThrottle(request, leaderAndIsrRequest.getErrorResponse(0, Errors.STALE_BROKER_EPOCH.exception))
     } else {
+      // 让副本管理器处理LeaderAndIsr请求
       val response = replicaManager.becomeLeaderOrFollower(correlationId, leaderAndIsrRequest,
         RequestHandlerHelper.onLeadershipChange(groupCoordinator, txnCoordinator, _, _))
       requestHelper.sendResponseExemptThrottle(request, response)
@@ -553,12 +560,14 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
-   * Handle a produce request
+   * 处理生产者发送的请求
+   * @param request
    */
   def handleProduceRequest(request: RequestChannel.Request): Unit = {
     val produceRequest = request.body[ProduceRequest]
     val requestSize = request.sizeInBytes
 
+    // 判断是否为事务类型的请求
     if (RequestUtils.hasTransactionalRecords(produceRequest)) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
         authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
@@ -568,19 +577,25 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // 未认证
     val unauthorizedTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 主题不存在
     val nonExistingTopicResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    // 请求不合法
     val invalidRequestResponses = mutable.Map[TopicPartition, PartitionResponse]()
+    //
     val authorizedRequestInfo = mutable.Map[TopicPartition, MemoryRecords]()
-    // cache the result to avoid redundant authorization calls
+    // 对主题写请求进行认证
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC,
       produceRequest.data().topicData().asScala)(_.name())
 
+    // 遍历生产者发送过来的和主题相关的信息，经过以下校验：
+    // 1.该生产者是否对该主题分区拥有「写」权限
+    // 2.该Borker是否拥有该主题的元数据信息
+    // 3.校验请求头版本号
     produceRequest.data.topicData.forEach(topic => topic.partitionData.forEach { partition =>
+      // 构建分区详情
       val topicPartition = new TopicPartition(topic.name, partition.index)
-      // This caller assumes the type is MemoryRecords and that is true on current serialization
-      // We cast the type to avoid causing big change to code base.
-      // https://issues.apache.org/jira/browse/KAFKA-10698
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
       if (!authorizedTopics.contains(topicPartition.topic))
         unauthorizedTopicResponses += topicPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
@@ -588,6 +603,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         nonExistingTopicResponses += topicPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
       else
         try {
+          // 校验版本号
           ProduceRequest.validateRecords(request.header.apiVersion, memoryRecords)
           authorizedRequestInfo += (topicPartition -> memoryRecords)
         } catch {
@@ -602,6 +618,8 @@ class KafkaApis(val requestChannel: RequestChannel,
     // https://issues.apache.org/jira/browse/KAFKA-10730
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicPartition, PartitionResponse]): Unit = {
+      logger.info("响应之前退出程序，触发leader选举，判断消息")
+      System.exit(0);
       val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
 
@@ -665,23 +683,25 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // 如果认证成功集合没有数据，则直接调用回调函数
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
       val internalTopicsAllowed = request.header.clientId == AdminUtils.AdminClientId
 
-      // call the replica manager to append messages to the replicas
+      // 调用副本管理器将Producer发送的消息追加到本地日志文件，并更新缓存数据
       replicaManager.appendRecords(
-        timeout = produceRequest.timeout.toLong,
-        requiredAcks = produceRequest.acks,
-        internalTopicsAllowed = internalTopicsAllowed,
+        timeout = produceRequest.timeout.toLong,          // 请求超时时间
+        requiredAcks = produceRequest.acks,               // ACKS
+        internalTopicsAllowed = internalTopicsAllowed,    // 是否允许访问内部主题
         origin = AppendOrigin.Client,
         entriesPerPartition = authorizedRequestInfo,
-        responseCallback = sendResponseCallback,
+        responseCallback = sendResponseCallback,          // 回调方法
         recordConversionStatsCallback = processingStatsCallback)
 
-      // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
-      // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      // 释放对data的引用，因为它已经被追加到日志文件中。
+      // 如果ACKS=all意味着需要等待其它处于ISR集合的副本同步完成后将响应发送给生产者，因此会构造一个延迟任务放入Purgatory队列，
+      // follower同步会直接从副本对象中获取
       produceRequest.clearPartitionRecords()
     }
   }
@@ -825,7 +845,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
-    // the callback for process a fetch response, invoked before throttling
+    // 回调远一点，处理FETCH响应，在限流之前调用 the callback for process a fetch response, invoked before throttling
     def processResponseCallback(responsePartitionData: Seq[(TopicPartition, FetchPartitionData)]): Unit = {
       val partitions = new util.LinkedHashMap[TopicPartition, FetchResponse.PartitionData[Records]]
       val reassigningPartitions = mutable.Set[TopicPartition]()
@@ -932,23 +952,23 @@ class KafkaApis(val requestChannel: RequestChannel,
     else
       quotas.fetch.getMaxValueInQuotaWindow(request.session, clientId).toInt
 
-    val fetchMaxBytes = Math.min(Math.min(fetchRequest.maxBytes, config.fetchMaxBytes), maxQuotaWindowBytes)
-    val fetchMinBytes = Math.min(fetchRequest.minBytes, fetchMaxBytes)
+    val fetchMaxBytes = Math.min(Math.min(fetchRequest.maxBytes, config.fetchMaxBytes), maxQuotaWindowBytes) // 默认值：10485760
+    val fetchMinBytes = Math.min(fetchRequest.minBytes, fetchMaxBytes) // 默认值：1
     if (interesting.isEmpty)
       processResponseCallback(Seq.empty)
     else {
-      // call the replica manager to fetch messages from the local replica
+      // 委托副本管理器从日志文件中获取消息
       replicaManager.fetchMessages(
-        fetchRequest.maxWait.toLong,
-        fetchRequest.replicaId,
-        fetchMinBytes,
-        fetchMaxBytes,
-        versionId <= 2,
-        interesting,
-        replicationQuota(fetchRequest),
-        processResponseCallback,
-        fetchRequest.isolationLevel,
-        clientMetadata)
+        fetchRequest.maxWait.toLong, // FETCH请求超时时间
+        fetchRequest.replicaId, // 由哪个副本发送的FETCH请求
+        fetchMinBytes, // 最小值（会经过限额管理器分配）
+        fetchMaxBytes, // 最大值（会经过限额管理器分配）
+        versionId <= 2, //
+        interesting, // Seq[(TopicPartition, PartitionData)]：数据容器
+        replicationQuota(fetchRequest), // 副本限额管理器
+        processResponseCallback, // 回调方法，处理FETCH响应
+        fetchRequest.isolationLevel, // FETCH隔离级别，默认值：READ_UNCOMMITTED
+        clientMetadata) // 发送FETCH请求的客户端元数据，包含clientId、clientAddress、listenerName等
     }
   }
 
@@ -1338,7 +1358,11 @@ class KafkaApis(val requestChannel: RequestChannel,
 
     requestHelper.sendResponseMaybeThrottle(request, createResponse)
   }
-  // 消费者第一步，查找消费组协调器
+
+  /**
+   * 这个方法可以同时处理找寻消费者组协调器和事务协调器，根据 {@link CoordinatorType} 区分
+   * @param request
+   */
   def handleFindCoordinatorRequest(request: RequestChannel.Request): Unit = {
     val findCoordinatorRequest = request.body[FindCoordinatorRequest]
 
@@ -1354,6 +1378,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           (groupCoordinator.partitionFor(findCoordinatorRequest.data.key), GROUP_METADATA_TOPIC_NAME)
 
         case CoordinatorType.TRANSACTION =>
+          // 通过%获取事务协调器位于哪个分区上
           (txnCoordinator.partitionFor(findCoordinatorRequest.data.key), TRANSACTION_STATE_TOPIC_NAME)
       }
       //
@@ -1460,6 +1485,7 @@ class KafkaApis(val requestChannel: RequestChannel,
    * ① 通过 {@link GroupCoordinator} 消费者组协调器中获取所有的消费组详情。
    * ② 通过 {@link AuthHelper} 做权限校验，剔除没有查看权限的消费组信息
    * ③ 创建Response对象并返回
+   *
    * @param request
    */
   def handleListGroupsRequest(request: RequestChannel.Request): Unit = {
@@ -1476,9 +1502,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         .setErrorCode(error.code)
         .setGroups(groups.map { group =>
           val listedGroup = new ListGroupsResponseData.ListedGroup()
-            .setGroupId(group.groupId)              // 消费都组ID
-            .setProtocolType(group.protocolType)    // 组协议类型
-            .setGroupState(group.state.toString)    // 消费者组状态
+            .setGroupId(group.groupId) // 消费都组ID
+            .setProtocolType(group.protocolType) // 组协议类型
+            .setGroupState(group.state.toString) // 消费者组状态
           listedGroup
         }.asJava)
         .setThrottleTimeMs(throttleMs)
@@ -1501,10 +1527,14 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  /**
+   * 处理Join Group 请求
+   * @param request 消费者发送的加入消费组请求
+   */
   def handleJoinGroupRequest(request: RequestChannel.Request): Unit = {
     val joinGroupRequest = request.body[JoinGroupRequest]
 
-    // the callback for sending a join-group response
+    // 定义回调方法
     def sendResponseCallback(joinResult: JoinGroupResult): Unit = {
       def createResponse(requestThrottleMs: Int): AbstractResponse = {
         val protocolName = if (request.context.apiVersion() >= 7)
@@ -1550,6 +1580,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       val protocols = joinGroupRequest.data.protocols.valuesList.asScala.map(protocol =>
         (protocol.name, protocol.metadata)).toList
 
+      // 让消费组协调器处理消费者发送的Join Group请求
       groupCoordinator.handleJoinGroup(
         joinGroupRequest.data.groupId,
         joinGroupRequest.data.memberId,
@@ -2055,10 +2086,15 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
   }
 
+  /**
+   * 初始化生产者PID
+   * @param request 请求体
+   */
   def handleInitProducerIdRequest(request: RequestChannel.Request): Unit = {
     val initProducerIdRequest = request.body[InitProducerIdRequest]
     val transactionalId = initProducerIdRequest.data.transactionalId
 
+    // 权限校验
     if (transactionalId != null) {
       if (!authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, transactionalId)) {
         requestHelper.sendErrorResponseMaybeThrottle(request, Errors.TRANSACTIONAL_ID_AUTHORIZATION_FAILED.exception)

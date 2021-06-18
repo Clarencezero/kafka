@@ -113,15 +113,24 @@ class TransactionCoordinator(brokerId: Int,
 
   val producerIdGenerator = createProducerIdGenerator()
 
+  /**
+   * 生成生产者的PID
+   *
+   * @param transactionalId             事务ID
+   * @param transactionTimeoutMs        事务超时时间
+   * @param expectedProducerIdAndEpoch
+   * @param responseCallback            回调方法
+   */
   def handleInitProducerId(transactionalId: String,
                            transactionTimeoutMs: Int,
                            expectedProducerIdAndEpoch: Option[ProducerIdAndEpoch],
                            responseCallback: InitProducerIdCallback): Unit = {
 
     if (transactionalId == null) {
-      // if the transactional id is null, then always blindly accept the request
-      // and return a new producerId from the producerId manager
+      // 如果只是幂等生产者，则transactionalId==null，直接分配PID并返回
       val producerId = producerIdGenerator.generateProducerId()
+
+      // 返回响应
       responseCallback(InitProducerIdResult(producerId, producerEpoch = 0, Errors.NONE))
     } else if (transactionalId.isEmpty) {
       // if transactional id is empty then return error as invalid request. This is

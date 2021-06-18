@@ -289,7 +289,7 @@ class KafkaServer(
         // 启动「SocketServer」，但不启动Processor
         socketServer.startup(startProcessingRequests = false)
 
-        // 启动「replica manager」副本管理器组件
+        // 启动「replica manager」副本管理器组aa
         alterIsrManager = if (config.interBrokerProtocolVersion.isAlterIsrSupported) {
           AlterIsrManager(
             config = config,

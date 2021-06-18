@@ -22,6 +22,11 @@ import kafka.server.LogOffsetMetadata
 import kafka.utils.Logging
 import org.apache.kafka.common.TopicPartition
 
+/**
+ *
+ * @param brokerId        副本所在的Broker ID
+ * @param topicPartition  分区详情
+ */
 class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Logging {
   // the log end offset value, kept in all replicas;
   // for local replica it is the log's end offset, for remote replicas its value is only updated by follower fetch
@@ -42,15 +47,25 @@ class Replica(val brokerId: Int, val topicPartition: TopicPartition) extends Log
   // the LEO of leader at time t. This is used to determine the lag of this follower and ISR of this partition.
   @volatile private[this] var _lastCaughtUpTimeMs = 0L
 
+  /**
+   * 起始消息偏移值
+   */
   def logStartOffset: Long = _logStartOffset
 
   def logEndOffsetMetadata: LogOffsetMetadata = _logEndOffsetMetadata
 
+  /**
+   * 下一条待写入的消息位移值
+   */
   def logEndOffset: Long = logEndOffsetMetadata.messageOffset
 
+  /**
+   * 最近一次副本拉取消息时间
+   * @return
+   */
   def lastCaughtUpTimeMs: Long = _lastCaughtUpTimeMs
 
-  /*
+  /**
    * If the FetchRequest reads up to the log end offset of the leader when the current fetch request is received,
    * set `lastCaughtUpTimeMs` to the time when the current fetch request was received.
    *

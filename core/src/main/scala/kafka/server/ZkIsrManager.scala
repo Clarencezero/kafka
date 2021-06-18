@@ -61,6 +61,11 @@ class ZkIsrManager(scheduler: Scheduler, time: Time, zkClient: KafkaZkClient) ex
     // has already happened, so we may as well send the notification to the controller.
   }
 
+  /**
+   *
+   * @param alterIsrItem
+   * @return
+   */
   override def submit(alterIsrItem: AlterIsrItem): Boolean = {
     debug(s"Writing new ISR ${alterIsrItem.leaderAndIsr.isr} to ZooKeeper with version " +
       s"${alterIsrItem.leaderAndIsr.zkVersion} for partition ${alterIsrItem.topicPartition}")

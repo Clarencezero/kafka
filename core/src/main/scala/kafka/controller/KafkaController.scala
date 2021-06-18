@@ -2989,6 +2989,8 @@ class KafkaController(val config: KafkaConfig,
         case IsrChangeNotification =>
           processIsrChangeNotification()
         case AlterIsrReceived(brokerId, brokerEpoch, isrsToAlter, callback) =>
+          // kafka2.7版本推出的功能，Broker的副本管理器每隔一断时间会对Leader副本的主题的ISR集合进行扩缩容处理，
+          // 如果发生了该事件，Broker会向Controller发送AlterIsr请求，由Controller向其它Broker广播
           processAlterIsr(brokerId, brokerEpoch, isrsToAlter, callback)
         case Startup =>
           // 当Broker启动时，生成Startup事件并交给ControllerEventManager处理

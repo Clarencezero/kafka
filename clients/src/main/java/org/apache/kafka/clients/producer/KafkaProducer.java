@@ -68,6 +68,7 @@ import org.apache.kafka.common.record.CompressionType;
 import org.apache.kafka.common.record.RecordBatch;
 import org.apache.kafka.common.requests.JoinGroupRequest;
 import org.apache.kafka.common.serialization.Serializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.common.utils.AppInfoParser;
 import org.apache.kafka.common.utils.KafkaThread;
 import org.apache.kafka.common.utils.LogContext;
@@ -89,102 +90,48 @@ import java.util.concurrent.atomic.AtomicReference;
 
 
 /**
- * A Kafka client that publishes records to the Kafka cluster.
+ * 属于Kafka客户端，即我们通常据说的生产者：将消息（records）发送到Kafka集群。
  * <P>
- * The producer is <i>thread safe</i> and sharing a single producer instance across threads will generally be faster than
- * having multiple instances.
+ * ① KafkaProducer属于线程安全的类。多个实例共享一个kafkaProducer会比同时拥有多个kafkaProducer要快。
  * <p>
- * Here is a simple example of using the producer to send records with strings containing sequential numbers as the key/value
- * pairs.
- * <pre>
- * {@code
- * Properties props = new Properties();
- * props.put("bootstrap.servers", "localhost:9092");
- * props.put("acks", "all");
- * props.put("retries", 0);
- * props.put("linger.ms", 1);
- * props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
- * props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
- *
- * Producer<String, String> producer = new KafkaProducer<>(props);
- * for (int i = 0; i < 100; i++)
- *     producer.send(new ProducerRecord<String, String>("my-topic", Integer.toString(i), Integer.toString(i)));
- *
- * producer.close();
- * }</pre>
+ * ② 生产者由一个「消息缓冲池」和后台I/O线程（即Sender线程）组成。用户线程通过KafkaProducer相关API发送消息，
+ *   消息首先被写入「消息缓冲池」，后台I/O线程负责将这些转换为「请求」并通过Java NIO 将它们传送到Kafka集群中。
+ *   如果生产者无法关闭则会造成资源泄漏。
  * <p>
- * The producer consists of a pool of buffer space that holds records that haven't yet been transmitted to the server
- * as well as a background I/O thread that is responsible for turning these records into requests and transmitting them
- * to the cluster. Failure to close the producer after use will leak these resources.
+ * ③ {@link #send(ProducerRecord) send()} 是异步方法。它会立即返回。这使得生产者可以将独立的单条消息组装成
+ *    批次处理，从而提高传输效率。
  * <p>
- * The {@link #send(ProducerRecord) send()} method is asynchronous. When called it adds the record to a buffer of pending record sends
- * and immediately returns. This allows the producer to batch together individual records for efficiency.
+ * ④ acks的配置控制「成功提交」的语义。如果配置为"all"是不会丢失消息，但会导致整个集群吞吐量下降。
  * <p>
- * The <code>acks</code> config controls the criteria under which requests are considered complete. The "all" setting
- * we have specified will result in blocking on the full commit of the record, the slowest but most durable setting.
+ * ⑤ 如果请求失败，生产者可以「自动」重试，重试次数默认是无限次。我们一般不会限制重试次数以避免资源浪费，更多的是通过
+ *    超时时间加以限制。还需要注意的是，重试可能导致broker重复写入同一条消息。但我们还是可以通过其他配置（如幂等、事务）等
+ *    使得满足相关的<a href="http://kafka.apache.org/documentation.html#semantics">消息传递语义</a>
  * <p>
- * If the request fails, the producer can automatically retry, though since we have specified <code>retries</code>
- * as 0 it won't. Enabling retries also opens up the possibility of duplicates (see the documentation on
- * <a href="http://kafka.apache.org/documentation.html#semantics">message delivery semantics</a> for details).
+ * ⑥ 生产者内部缓存没有发送的消息，每个批次的大小是由「batch.size」限制的。如果配置过大则需要更多内存，配置过小则会降低传输效率。
+ *    需要根据现场测试选择合适的值。
  * <p>
- * The producer maintains buffers of unsent records for each partition. These buffers are of a size specified by
- * the <code>batch.size</code> config. Making this larger can result in more batching, but requires more memory (since we will
- * generally have one of these buffers for each active partition).
+ * ⑦ 默认情况下，即使缓冲区中还有其他未使用的空间，缓冲区也可以立即被发送。如果用户需要减少请求数，可以将「linger.ms」设置为大于0的值，这意味着
+ *    生产者在发出请求之前等待「linger.ms」毫秒，期望能有更多的数据填满缓冲区。如果生产者生产消息很多，则保持默认值（0），如果生产者消息不多，则可以
+ *    舍弃低延迟，以减少请求次数。
  * <p>
- * By default a buffer is available to send immediately even if there is additional unused space in the buffer. However if you
- * want to reduce the number of requests you can set <code>linger.ms</code> to something greater than 0. This will
- * instruct the producer to wait up to that number of milliseconds before sending a request in hope that more records will
- * arrive to fill up the same batch. This is analogous to Nagle's algorithm in TCP. For example, in the code snippet above,
- * likely all 100 records would be sent in a single request since we set our linger time to 1 millisecond. However this setting
- * would add 1 millisecond of latency to our request waiting for more records to arrive if we didn't fill up the buffer. Note that
- * records that arrive close together in time will generally batch together even with <code>linger.ms=0</code> so under heavy load
- * batching will occur regardless of the linger configuration; however setting this to something larger than 0 can lead to fewer, more
- * efficient requests when not under maximal load at the cost of a small amount of latency.
+ * ⑧ 「buffer.memory」控制着生产者可用缓冲区总大小。如果缓冲区耗尽，其它发送调用将会被阻塞（阻塞于内存空间申请这一步），阻塞时间由「max.block.ms」确定，
+ *    超时则会抛出 {@link TimeoutException} 异常
  * <p>
- * The <code>buffer.memory</code> controls the total amount of memory available to the producer for buffering. If records
- * are sent faster than they can be transmitted to the server then this buffer space will be exhausted. When the buffer space is
- * exhausted additional send calls will block. The threshold for time to block is determined by <code>max.block.ms</code> after which it throws
- * a TimeoutException.
+ * ⑨ 从0.11开始，生产者支持两种额外的模式：幂等生产者和事务生产者。幂等生产者增强Kafka传输语义：从至少一次（at least once）到恰好一次（exactly once）。
+ *    特别是生产者重试时不会导致消息重复。事务生产者允许在一个事务内可以向多个主题（topic）发送消息，要么都成功，要么都失败。
+ *    幂等生产者需要将「enable.idempotence」设置为true，这会导致 retries=Integer.MAX_VALUE 和 acks=all。
  * <p>
- * The <code>key.serializer</code> and <code>value.serializer</code> instruct how to turn the key and value objects the user provides with
- * their <code>ProducerRecord</code> into bytes. You can use the included {@link org.apache.kafka.common.serialization.ByteArraySerializer} or
- * {@link org.apache.kafka.common.serialization.StringSerializer} for simple string or byte types.
+ * ⑩ 为了复用幂等生产者的优势，必须避免应用层面的重发，因为这些重发不能被删除。因此，如果一个生产者启用幂等功能，不推荐再设置retries，它默认为Integer.MAX_VALUE。
+ *    此外，即使{@link #send(ProducerRecord)}方法在无限重试的情况下也会返回错误（比如在发送前缓存在buffer中的消息过期了），那么建议关闭生产者并检查最后产生的消息的内容，
+ *    确保它不重复写入。最后，生产者只能保证在一个会话中发送的消息的幂等性。
  * <p>
- * From Kafka 0.11, the KafkaProducer supports two additional modes: the idempotent producer and the transactional producer.
- * The idempotent producer strengthens Kafka's delivery semantics from at least once to exactly once delivery. In particular
- * producer retries will no longer introduce duplicates. The transactional producer allows an application to send messages
- * to multiple partitions (and topics!) atomically.
- * </p>
+ * ⑪ 要使用事务生产者，则需要设置「transactional.id」，同时也意味着幂等生产者（enable.idempotence=true自动被设置）。此外，包含在事务中的主题应该被设置为「durability」持久的。
+ *    特别的，「replication.factor」应该至少大于等于3，「min.insync.replicas」设置为2。最后，为了实现端到端的事务性保证，消费者必须被设置为只读取已提交的消息。
  * <p>
- * To enable idempotence, the <code>enable.idempotence</code> configuration must be set to true. If set, the
- * <code>retries</code> config will default to <code>Integer.MAX_VALUE</code> and the <code>acks</code> config will
- * default to <code>all</code>. There are no API changes for the idempotent producer, so existing applications will
- * not need to be modified to take advantage of this feature.
- * </p>
- * <p>
- * To take advantage of the idempotent producer, it is imperative to avoid application level re-sends since these cannot
- * be de-duplicated. As such, if an application enables idempotence, it is recommended to leave the <code>retries</code>
- * config unset, as it will be defaulted to <code>Integer.MAX_VALUE</code>. Additionally, if a {@link #send(ProducerRecord)}
- * returns an error even with infinite retries (for instance if the message expires in the buffer before being sent),
- * then it is recommended to shut down the producer and check the contents of the last produced message to ensure that
- * it is not duplicated. Finally, the producer can only guarantee idempotence for messages sent within a single session.
- * </p>
- * <p>To use the transactional producer and the attendant APIs, you must set the <code>transactional.id</code>
- * configuration property. If the <code>transactional.id</code> is set, idempotence is automatically enabled along with
- * the producer configs which idempotence depends on. Further, topics which are included in transactions should be configured
- * for durability. In particular, the <code>replication.factor</code> should be at least <code>3</code>, and the
- * <code>min.insync.replicas</code> for these topics should be set to 2. Finally, in order for transactional guarantees
- * to be realized from end-to-end, the consumers must be configured to read only committed messages as well.
- * </p>
- * <p>
- * The purpose of the <code>transactional.id</code> is to enable transaction recovery across multiple sessions of a
- * single producer instance. It would typically be derived from the shard identifier in a partitioned, stateful, application.
- * As such, it should be unique to each producer instance running within a partitioned application.
- * </p>
- * <p>All the new transactional APIs are blocking and will throw exceptions on failure. The example
- * below illustrates how the new APIs are meant to be used. It is similar to the example above, except that all
- * 100 messages are part of a single transaction.
- * </p>
+ * ⑫ Transactional.id 的目的是为了在一个生产者实例的多个会话中实现事务恢复。
+ *    在一个分区的、有状态的应用程序中，它通常来自分片标识符。因此，它应该是在分区应用程序中运行的每个生产者实例所独有的。
+ *    所有新的事务性API都是阻塞性的，在失败时将会抛出异常。
+ *    下面的例子说明了新的API是如何被使用的。它与上面的例子类似，只是所有的100条消息都是一个交易的一部分。
  * <p>
  * <pre>
  * {@code
@@ -192,9 +139,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * props.put("bootstrap.servers", "localhost:9092");
  * props.put("transactional.id", "my-transactional-id");
  * Producer<String, String> producer = new KafkaProducer<>(props, new StringSerializer(), new StringSerializer());
- *
  * producer.initTransactions();
- *
  * try {
  *     producer.beginTransaction();
  *     for (int i = 0; i < 100; i++)
@@ -209,28 +154,21 @@ import java.util.concurrent.atomic.AtomicReference;
  * }
  * producer.close();
  * } </pre>
- * </p>
+ * ⑬ 正如例子中所暗示的，每个生产者只能有一个开放的事务。
+ *   在{@link #beginTransaction()}和{@link #commitTransaction()}调用之间发送的所有消息将是一个事务的一部分。
+ *   当指定了transactional.id后，生产者发送的所有消息必须是一个事务的一部分
  * <p>
- * As is hinted at in the example, there can be only one open transaction per producer. All messages sent between the
- * {@link #beginTransaction()} and {@link #commitTransaction()} calls will be part of a single transaction. When the
- * <code>transactional.id</code> is specified, all messages sent by the producer must be part of a transaction.
- * </p>
+ * ⑭ 事务生产者使用异常来传达错误状态。特别是，不需要为{@link #send}方法指定回调函数，也不需要在返回的Future上调用.get()：
+ *    如果在事务中，任何一个{@link #send}或事务性调用遇到不可恢复的错误，都会抛出一个KafkaException。
+ *    关于从事务性发送中检测错误的更多细节，请参阅{@link #send(ProducerRecord, Callback)}文档。
  * <p>
- * The transactional producer uses exceptions to communicate error states. In particular, it is not required
- * to specify callbacks for <code>producer.send()</code> or to call <code>.get()</code> on the returned Future: a
- * <code>KafkaException</code> would be thrown if any of the
- * <code>producer.send()</code> or transactional calls hit an irrecoverable error during a transaction. See the {@link #send(ProducerRecord)}
- * documentation for more details about detecting errors from a transactional send.
- * </p>
- * </p>By calling
- * <code>producer.abortTransaction()</code> upon receiving a <code>KafkaException</code> we can ensure that any
- * successful writes are marked as aborted, hence keeping the transactional guarantees.
- * </p>
+ * ⑮ 通过在收到KafkaException异常时调用 {@link #abortTransaction()}，我们可以确保任何成功的写入被标记为中止，从而保证事务一致性。
  * <p>
- * This client can communicate with brokers that are version 0.10.0 or newer. Older or newer brokers may not support
- * certain client features.  For instance, the transactional APIs need broker versions 0.11.0 or later. You will receive an
- * <code>UnsupportedVersionException</code> when invoking an API that is not available in the running broker version.
- * </p>
+ * ⑯ 这个客户端可以与0.10.0或更新版本的brokers进行通信。
+ *    较旧或较新的经纪商可能不支持某些客户端功能。
+ *    例如，使用事务特性需要版本号>=0.11.0，如果版本不匹配，抛出 UnsupportedVersionException 异常。
+ *
+ * ⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳
  */
 public class KafkaProducer<K, V> implements Producer<K, V> {
 
@@ -242,22 +180,48 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private final String clientId;
     // Visible for testing
     final Metrics metrics;
+
+    // 分区器
     private final Partitioner partitioner;
+
+    // 请求本身最大值。未压缩最大上限。 默认值：1048576（Byte）,1MB
     private final int maxRequestSize;
+
+    // 等待发送内存缓存上限，默认值：32MB
     private final long totalMemorySize;
+
+    // 集群元信息
     private final ProducerMetadata metadata;
+
+    // △消息累加器
     private final RecordAccumulator accumulator;
+
+    // 消息发送线程
     private final Sender sender;
     private final Thread ioThread;
+
+    // 消息压缩类型
     private final CompressionType compressionType;
     private final Sensor errors;
     private final Time time;
+
+    // 键值序列化器
     private final Serializer<K> keySerializer;
     private final Serializer<V> valueSerializer;
+
+    // 生产者端配置类
     private final ProducerConfig producerConfig;
+
+    // 最大阻塞时间，默认值：60S
     private final long maxBlockTimeMs;
+
+    // 拦截器，Kafka提供的扩展点
     private final ProducerInterceptors<K, V> interceptors;
+
+    // 请求版本号
     private final ApiVersions apiVersions;
+
+    // 事务（幂等）管理器
     private final TransactionManager transactionManager;
 
     /**
@@ -394,16 +358,20 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             this.compressionType = CompressionType.forName(config.getString(ProducerConfig.COMPRESSION_TYPE_CONFIG));
 
             this.maxBlockTimeMs = config.getLong(ProducerConfig.MAX_BLOCK_MS_CONFIG);
+            // 发送时间超时 120S
             int deliveryTimeoutMs = configureDeliveryTimeout(config, log);
 
             this.apiVersions = new ApiVersions();
+            // 创建事务管理器
             this.transactionManager = configureTransactionState(config, logContext);
+            // 创建一个新的「RecordAccumulator」消息累加器
+            // 一个 KafkaProducer 对象对应一个消息累加器
             this.accumulator = new RecordAccumulator(logContext,
-                    config.getInt(ProducerConfig.BATCH_SIZE_CONFIG),
+                    config.getInt(ProducerConfig.BATCH_SIZE_CONFIG),    // 批次大小，默认值：16KB
                     this.compressionType,
-                    lingerMs(config),
-                    retryBackoffMs,
-                    deliveryTimeoutMs,
+                    lingerMs(config),   // 默认值：0。不开启
+                    retryBackoffMs,     // 重试退避时间，默认值：100ms
+                    deliveryTimeoutMs,  // 传输超时时间，默认值：120S
                     metrics,
                     PRODUCER_METRIC_GROUP_NAME,
                     time,
@@ -411,6 +379,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
                     transactionManager,
                     new BufferPool(this.totalMemorySize, config.getInt(ProducerConfig.BATCH_SIZE_CONFIG), metrics, time, PRODUCER_METRIC_GROUP_NAME));
 
+            // 解析IP地址，可能需要查询DNS
             List<InetSocketAddress> addresses = ClientUtils.parseAndValidateAddresses(
                     config.getList(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG),
                     config.getString(ProducerConfig.CLIENT_DNS_LOOKUP_CONFIG));
@@ -441,8 +410,17 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         }
     }
 
-    // visible for testing
+    /**
+     * 实例化 {@link Sender} 对象
+     * ① 创建 {@link KafkaClient} 类型实例对象，它只有一个默认实现类 {@link NetworkClient}
+     * ② 实例化 {@link Sender} 对象
+     * @param logContext
+     * @param kafkaClient
+     * @param metadata
+     * @return
+     */
     Sender newSender(LogContext logContext, KafkaClient kafkaClient, ProducerMetadata metadata) {
+        // 从配置文件中获取「in-flight」数量，表示已发送但未收到响应的请求个数
         int maxInflightRequests = configureInflightRequests(producerConfig);
         int requestTimeoutMs = producerConfig.getInt(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG);
         ChannelBuilder channelBuilder = ClientUtils.createChannelBuilder(producerConfig, time, logContext);
@@ -511,6 +489,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         return deliveryTimeoutMs;
     }
 
+    /**
+     * 根据配置创建事务管理器 {@link TransactionManager}
+     * @param config            生产者配置详情
+     * @param logContext        日志上下文
+     * @return
+     */
     private TransactionManager configureTransactionState(ProducerConfig config,
                                                          LogContext logContext) {
 
@@ -522,6 +506,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             log.info("Overriding the default {} to true since {} is specified.", ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG,
                     ProducerConfig.TRANSACTIONAL_ID_CONFIG);
 
+        // 如果为幂等生产者，则会创建事务管理器
         if (config.idempotenceEnabled()) {
             final String transactionalId = config.getString(ProducerConfig.TRANSACTIONAL_ID_CONFIG);
             final int transactionTimeoutMs = config.getInt(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG);
@@ -1364,5 +1349,24 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
             if (this.userCallback != null)
                 this.userCallback.onCompletion(metadata, exception);
         }
+    }
+
+    public static void main(String[] args) throws Exception{
+        final String SERVER = "192.168.217.128:9092";
+        final String TOPIC3 = "james";
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, SERVER);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+
+        KafkaProducer<String, String> producer = new KafkaProducer<>(props);
+        ProducerRecord<String, String> r1 = new ProducerRecord<>(TOPIC3, 0, null, "HELLO WORLD_par_1");
+        ProducerRecord<String, String> r2 = new ProducerRecord<>(TOPIC3, 0, null, "HELLO WORLD_par_2");
+
+        producer.send(r1);
+        producer.send(r2);
+
+        TimeUnit.HOURS.sleep(1);
     }
 }

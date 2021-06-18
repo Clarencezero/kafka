@@ -36,6 +36,7 @@ import scala.collection.mutable.ListBuffer
 import scala.jdk.CollectionConverters._
 
 /**
+ * 向Controller发送AlterIsr请求
  * Handles updating the ISR by sending AlterIsr requests to the controller (as of 2.7) or by updating ZK directly
  * (prior to 2.7). Updating the ISR is an asynchronous operation, so partitions will learn about the result of their
  * request through a callback.
@@ -154,6 +155,10 @@ class DefaultAlterIsrManager(
     }
   }
 
+  /**
+   * 向Broker发送AlterIsr请求，告诉Controller当前Broker管理的某些主题的ISR集合发生变更
+   * @param inflightAlterIsrItems
+   */
   private def sendRequest(inflightAlterIsrItems: Seq[AlterIsrItem]): Unit = {
     val message = buildRequest(inflightAlterIsrItems)
     debug(s"Sending AlterIsr to controller $message")

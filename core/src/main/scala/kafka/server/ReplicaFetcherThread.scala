@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -43,6 +43,21 @@ import scala.jdk.CollectionConverters._
 import scala.collection.{Map, mutable}
 import scala.compat.java8.OptionConverters._
 
+/**
+ *
+ *
+ * @param name                       线程名称
+ * @param fetcherId                  Follower拉取的线程ID，单台Broker上，允许存在多个 {@link ReplicaFetcherThread} 拉取线程。
+ *                                   由Broker配置参数「num.replica.fetchers」决定。
+ * @param sourceBroker               数据源Broker地址，决定当前Follower从哪个Broker同步数据
+ * @param brokerConfig               封装了Broker端所有配置信息
+ * @param failedPartitions           拉取数据过程中失败的分区列表
+ * @param replicaMgr                 副本管理器，同步线程通过副本管理器获取分区对象、副本对象以下日志对象
+ * @param metrics                    监控指标
+ * @param time                       时间工具类
+ * @param quota                      配额
+ * @param leaderEndpointBlockingSend 网络I/O工具类，用于实现同步发送请求。
+ */
 class ReplicaFetcherThread(name: String,
                            fetcherId: Int,
                            sourceBroker: BrokerEndPoint,
@@ -54,23 +69,27 @@ class ReplicaFetcherThread(name: String,
                            quota: ReplicaQuota,
                            leaderEndpointBlockingSend: Option[BlockingSend] = None)
   extends AbstractFetcherThread(name = name,
-                                clientId = name,
-                                sourceBroker = sourceBroker,
-                                failedPartitions,
-                                fetchBackOffMs = brokerConfig.replicaFetchBackoffMs,
-                                isInterruptible = false,
-                                replicaMgr.brokerTopicStats) {
-
+    clientId = name,
+    sourceBroker = sourceBroker,
+    failedPartitions,
+    fetchBackOffMs = brokerConfig.replicaFetchBackoffMs,
+    isInterruptible = false,
+    replicaMgr.brokerTopicStats) {
+  /**
+   * 副本ID也就是副本所在的broker的ID号
+   */
   private val replicaId = brokerConfig.brokerId
-  private val logContext = new LogContext(s"[ReplicaFetcher replicaId=$replicaId, leaderId=${sourceBroker.id}, " +
-    s"fetcherId=$fetcherId] ")
+  private val logContext = new LogContext(s"[ReplicaFetcher replicaId=$replicaId, leaderId=${sourceBroker.id}, " + s"fetcherId=$fetcherId] ")
   this.logIdent = logContext.logPrefix
 
+  /**
+   * 可以看成和Leader建立的TCP连接，用于执行请求发送的类
+   * {@link ReplicaFetcherBlockingSend} 封装了和网络相关的组件，用于执行阻塞式的I/O操作
+   */
   private val leaderEndpoint = leaderEndpointBlockingSend.getOrElse(
     new ReplicaFetcherBlockingSend(sourceBroker, brokerConfig, metrics, time, fetcherId,
       s"broker-$replicaId-fetcher-$fetcherId", logContext))
 
-  // Visible for testing
   private[server] val fetchRequestVersion: Short =
     if (brokerConfig.interBrokerProtocolVersion >= KAFKA_2_7_IV1) 12
     else if (brokerConfig.interBrokerProtocolVersion >= KAFKA_2_3_IV1) 11
@@ -102,18 +121,45 @@ class ReplicaFetcherThread(name: String,
     else if (brokerConfig.interBrokerProtocolVersion >= KAFKA_0_10_1_IV2) 1
     else 0
 
+  /**
+   * Follower发送的TETCH请求被处理返回前的最大等待时间，这在一定程度上可以提高传输效率。
+   * Leader如果没有新的数据返回给Follower，会让这个请求等待maxWait时间，有概率得到生产者生产的新的消息
+   */
   private val maxWait = brokerConfig.replicaFetchWaitMaxMs
+
+  /**
+   * 每个FETCH Response返回前必须要累积的最小字节数，目的是减少不必要的FETCH请求
+   */
   private val minBytes = brokerConfig.replicaFetchMinBytes
+  /**
+   * 每个FETCH Response返回前必须要累积的最大字节数
+   */
   private val maxBytes = brokerConfig.replicaFetchResponseMaxBytes
+
+  /**
+   * 单个分区所能获得的最大字节数
+   */
   private val fetchSize = brokerConfig.replicaFetchMaxBytes
   override protected val isOffsetForLeaderEpochSupported: Boolean = brokerConfig.interBrokerProtocolVersion >= KAFKA_0_11_0_IV2
   override protected val isTruncationOnFetchSupported = ApiVersion.isTruncationOnFetchSupported(brokerConfig.interBrokerProtocolVersion)
+
+  /**
+   * 维持和某个Broker连接上获取会话状态的类
+   */
   val fetchSessionHandler = new FetchSessionHandler(logContext, sourceBroker.id)
 
+  /**
+   * 从副本管理器中获取最新的Leader版本号，
+   * 本质是从文件leader-epoch-checkpoint中获取该分区的最新的Leader版本号
+   *
+   * @param topicPartition
+   * @return
+   */
   override protected def latestEpoch(topicPartition: TopicPartition): Option[Int] = {
     replicaMgr.localLogOrException(topicPartition).latestEpoch
   }
 
+  // 获取某分区的Log Start Offset值，如果缓存没有，则抛出异常
   override protected def logStartOffset(topicPartition: TopicPartition): Long = {
     replicaMgr.localLogOrException(topicPartition).logStartOffset
   }
@@ -155,50 +201,70 @@ class ReplicaFetcherThread(name: String,
     }
   }
 
-  // process fetched data
+  /**
+   * 处理从Leader获取的消息数据
+   * 1.解析、转换Response数据
+   * 2.将数据持久化至本地日志文件中
+   * 3.更新HW值
+   * 4.尝试更新Follower的Log Start Offset
+   *
+   * @param topicPartition 读取的分区详情
+   * @param fetchOffset    读取到的最新位移值
+   * @param partitionData  读取到的分区消息数据
+   * @return 写入已读取消息数据前的元数据
+   */
   override def processPartitionData(topicPartition: TopicPartition,
                                     fetchOffset: Long,
                                     partitionData: FetchData): Option[LogAppendInfo] = {
     val logTrace = isTraceEnabled
+    // 从副本管理器中获取分区对象，该对象包含底层日志管理器、元数据缓存等对象
     val partition = replicaMgr.getPartitionOrException(topicPartition)
-    val log = partition.localLogOrException
-    val records = toMemoryRecords(partitionData.records)
 
+    // 获取「LogManager」对象
+    val log = partition.localLogOrException
+
+    // 将获取以的数据转换成符合格式要求的消息集合
+    val records = toMemoryRecords(partitionData.records)
     maybeWarnIfOversizedRecords(records, topicPartition)
 
+    // 如果本次读取的起始位移值和Follower的LEO值不相等，那么会导致follower日志不连续，抛出异常
     if (fetchOffset != log.logEndOffset)
-      throw new IllegalStateException("Offset mismatch for partition %s: fetched offset = %d, log end offset = %d.".format(
-        topicPartition, fetchOffset, log.logEndOffset))
+      throw new IllegalStateException("Offset mismatch for partition %s: fetched offset = %d, log end offset = %d.".format(topicPartition, fetchOffset, log.logEndOffset))
 
     if (logTrace)
-      trace("Follower has replica log end offset %d for partition %s. Received %d messages and leader hw %d"
-        .format(log.logEndOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
+      trace("Follower has replica log end offset %d for partition %s. Received %d messages and leader hw %d".format(log.logEndOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
 
-    // Append the leader's messages to the log
+    // 持久化操作：将消息记录追加到follower本地日志文件中
     val logAppendInfo = partition.appendRecordsToFollowerOrFutureReplica(records, isFuture = false)
 
     if (logTrace)
-      trace("Follower has replica log end offset %d after appending %d bytes of messages for partition %s"
-        .format(log.logEndOffset, records.sizeInBytes, topicPartition))
+      trace("Follower has replica log end offset %d after appending %d bytes of messages for partition %s".format(log.logEndOffset, records.sizeInBytes, topicPartition))
+
+    // 从响应中获取Leader的Log Start Offset
     val leaderLogStartOffset = partitionData.logStartOffset
 
     // For the follower replica, we do not need to keep its segment base offset and physical position.
     // These values will be computed upon becoming leader or handling a preferred read replica fetch.
+    // 更新Follower的HW值，HW是保存在Log日志对象中
     val followerHighWatermark = log.updateHighWatermark(partitionData.highWatermark)
+
+    // 尝试更新Follower的Log Start Offset
     log.maybeIncrementLogStartOffset(leaderLogStartOffset, LeaderOffsetIncremented)
-    if (logTrace)
-      trace(s"Follower set replica high watermark for partition $topicPartition to $followerHighWatermark")
+    if (logTrace) trace(s"Follower set replica high watermark for partition $topicPartition to $followerHighWatermark")
 
     // Traffic from both in-sync and out of sync replicas are accounted for in replication quota to ensure total replication
     // traffic doesn't exceed quota.
+    // 配额、限流处理
     if (quota.isThrottled(topicPartition))
       quota.record(records.sizeInBytes)
 
+    // 更新统计指标
     if (partition.isReassigning && partition.isAddingLocalReplica)
       brokerTopicStats.updateReassignmentBytesIn(records.sizeInBytes)
 
     brokerTopicStats.updateReplicationBytesIn(records.sizeInBytes)
 
+    // 返回日志写入结果
     logAppendInfo
   }
 
@@ -240,10 +306,10 @@ class ReplicaFetcherThread(name: String,
     val topic = new ListOffsetsTopic()
       .setName(topicPartition.topic)
       .setPartitions(Collections.singletonList(
-          new ListOffsetsPartition()
-            .setPartitionIndex(topicPartition.partition)
-            .setCurrentLeaderEpoch(currentLeaderEpoch)
-            .setTimestamp(earliestOrLatest)))
+        new ListOffsetsPartition()
+          .setPartitionIndex(topicPartition.partition)
+          .setCurrentLeaderEpoch(currentLeaderEpoch)
+          .setTimestamp(earliestOrLatest)))
     val requestBuilder = ListOffsetsRequest.Builder.forReplica(listOffsetRequestVersion, replicaId)
       .setTargetTimes(Collections.singletonList(topic))
 
@@ -252,7 +318,7 @@ class ReplicaFetcherThread(name: String,
     val responsePartition = response.topics.asScala.find(_.name == topicPartition.topic).get
       .partitions.asScala.find(_.partitionIndex == topicPartition.partition).get
 
-     Errors.forCode(responsePartition.errorCode) match {
+    Errors.forCode(responsePartition.errorCode) match {
       case Errors.NONE =>
         if (brokerConfig.interBrokerProtocolVersion >= KAFKA_0_10_1_IV2)
           responsePartition.offset
@@ -262,6 +328,9 @@ class ReplicaFetcherThread(name: String,
     }
   }
 
+  /**
+   * 构建FETCH请求
+   */
   override def buildFetch(partitionMap: Map[TopicPartition, PartitionFetchState]): ResultWithPartitions[Option[ReplicaFetch]] = {
     val partitionsWithError = mutable.Set[TopicPartition]()
 
@@ -376,8 +445,8 @@ class ReplicaFetcherThread(name: String,
   }
 
   /**
-   *  To avoid ISR thrashing, we only throttle a replica on the follower if it's in the throttled replica list,
-   *  the quota is exceeded and the replica is not in sync.
+   * To avoid ISR thrashing, we only throttle a replica on the follower if it's in the throttled replica list,
+   * the quota is exceeded and the replica is not in sync.
    */
   private def shouldFollowerThrottle(quota: ReplicaQuota, fetchState: PartitionFetchState, topicPartition: TopicPartition): Boolean = {
     !fetchState.isReplicaInSync && quota.isThrottled(topicPartition) && quota.isQuotaExceeded

@@ -42,9 +42,10 @@ import scala.jdk.CollectionConverters._
  * Leader Epoch = epoch assigned to each leader by the controller.
  * Offset = offset of the first message in each epoch.
  *
- * @param topicPartition the associated topic partition
- * @param checkpoint the checkpoint file
- * @param logEndOffset function to fetch the current log end offset
+ *
+ * @param topicPartition 每个分区都会有一个Leader Epoch值
+ * @param logEndOffset   一个函数，用于获取当前的日志结束偏移量（Log End Offset）
+ * @param checkpoint     检查点文件，该文件内容保存<Leader 版本号, 该Leader第一条消息位移值>
  */
 class LeaderEpochFileCache(topicPartition: TopicPartition,
                            logEndOffset: () => Long,

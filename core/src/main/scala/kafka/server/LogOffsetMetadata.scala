@@ -32,7 +32,12 @@ object LogOffsetMetadata {
 
 }
 
-/*
+/**
+ * 日志位移元数据，包括
+ * 1.消息位移
+ * 2.段基地址
+ * 3.本地日志段物理位移
+ *
  * A log offset structure, including:
  *  1. the message offset
  *  2. the base message offset of the located segment

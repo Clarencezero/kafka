@@ -370,8 +370,7 @@ public enum Errors {
     static {
         for (Errors error : Errors.values()) {
             if (codeToError.put(error.code(), error) != null)
-                throw new ExceptionInInitializerError("Code " + error.code() + " for error " +
-                        error + " has already been used");
+                throw new ExceptionInInitializerError("Code " + error.code() + " for error " + error + " has already been used");
 
             if (error.exception != null)
                 classToError.put(error.exception.getClass(), error);

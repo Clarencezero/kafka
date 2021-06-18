@@ -6,7 +6,7 @@
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -46,19 +46,19 @@ trait MetadataCache {
    * Return topic metadata for a given set of topics and listener. See KafkaApis#handleTopicMetadataRequest for details
    * on the use of the two boolean flags.
    *
-   * @param topics                      The set of topics.
-   * @param listenerName                The listener name.
-   * @param errorUnavailableEndpoints   If true, we return an error on unavailable brokers. This is used to support
-   *                                    MetadataResponse version 0.
-   * @param errorUnavailableListeners   If true, return LEADER_NOT_AVAILABLE if the listener is not found on the leader.
-   *                                    This is used for MetadataResponse versions 0-5.
-   * @return                            A collection of topic metadata.
+   * @param topics                    The set of topics.
+   * @param listenerName              The listener name.
+   * @param errorUnavailableEndpoints If true, we return an error on unavailable brokers. This is used to support
+   *                                  MetadataResponse version 0.
+   * @param errorUnavailableListeners If true, return LEADER_NOT_AVAILABLE if the listener is not found on the leader.
+   *                                  This is used for MetadataResponse versions 0-5.
+   * @return A collection of topic metadata.
    */
   def getTopicMetadata(
-    topics: collection.Set[String],
-    listenerName: ListenerName,
-    errorUnavailableEndpoints: Boolean = false,
-    errorUnavailableListeners: Boolean = false): collection.Seq[MetadataResponseData.MetadataResponseTopic]
+                        topics: collection.Set[String],
+                        listenerName: ListenerName,
+                        errorUnavailableEndpoints: Boolean = false,
+                        errorUnavailableListeners: Boolean = false): collection.Seq[MetadataResponseData.MetadataResponseTopic]
 
   def getAllTopics(): collection.Set[String]
 
@@ -77,9 +77,9 @@ trait MetadataCache {
   /**
    * Get a partition leader's endpoint
    *
-   * @return  If the leader is known, and the listener name is available, return Some(node). If the the leader is known,
-   *          but the listener is unavailable, return Some(Node.NO_NODE). Otherwise, if the leader is not known,
-   *          return None
+   * @return If the leader is known, and the listener name is available, return Some(node). If the the leader is known,
+   *         but the listener is unavailable, return Some(Node.NO_NODE). Otherwise, if the leader is not known,
+   *         return None
    */
   def getPartitionLeaderEndpoint(topic: String, partitionId: Int, listenerName: ListenerName): Option[Node]
 
@@ -92,7 +92,7 @@ trait MetadataCache {
   /**
    * Update the metadata cache with a given UpdateMetadataRequest.
    *
-   * @return  The deleted topics from the given UpdateMetadataRequest.
+   * @return The deleted topics from the given UpdateMetadataRequest.
    */
   def updateMetadata(correlationId: Int, request: UpdateMetadataRequest): collection.Seq[TopicPartition]
 
@@ -112,16 +112,28 @@ object MetadataCache {
 }
 
 /**
- *  A cache for the state (e.g., current leader) of each partition. This cache is updated through
- *  UpdateMetadataRequest from the controller. Every broker maintains the same cache, asynchronously.
+ * A cache for the state (e.g., current leader) of each partition. This cache is updated through
+ * UpdateMetadataRequest from the controller. Every broker maintains the same cache, asynchronously.
+ * MetadataCache类的方法大致分为三类：1.判断 2.获取 3.更新
+ * 1.判断。就是判断给定的证明或分区是否存在元数据缓存中。
+ * 2.获取。getAllTopics()dh getAllPartitions、getPartitionReplicaEndPoints()
+ *
+ * 由于缓存是异步更新，整个集群的元数据并非是强一致性的，但好在Kafka集群能够自行处理过期元数据的问题，缓存过期在实际的应用场景中造成的影响并不严重。
  */
 class ZkMetadataCache(brokerId: Int) extends MetadataCache with Logging {
 
   private val partitionMetadataLock = new ReentrantReadWriteLock()
-  //this is the cache state. every MetadataSnapshot instance is immutable, and updates (performed under a lock)
-  //replace the value with a completely new one. this means reads (which are not under any lock) need to grab
-  //the value of this var (into a val) ONCE and retain that read copy for the duration of their operation.
-  //multiple reads of this value risk getting different snapshots.
+  // this is the cache state. every MetadataSnapshot instance is immutable, and updates (performed under a lock)
+  // replace the value with a completely new one. this means reads (which are not under any lock) need to grab
+  // the value of this var (into a val) ONCE and retain that read copy for the duration of their operation.
+  // multiple reads of this value risk getting different snapshots.
+  /**
+   * 元数据快照，包括分区状态、主题ID、控制器ID、存活的Brokers、
+   * partitionStates：Map<主题名称, Map<分区号, UpdateMetadataPartitionState(UpdateMetadataRequest请求内部所需的数据结构)>>
+   * controllerId：Controller所在的Broker ID。
+   * aliveBrokers：当前集群中所有存活着的Broker对象列表
+   * aliveNodes：Map<Broker ID, Map<ListenerName, Broker节点对象>>
+   */
   @volatile private var metadataSnapshot: MetadataSnapshot = MetadataSnapshot(partitionStates = mutable.AnyRefMap.empty,
     topicIds = Map.empty, controllerId = None, aliveBrokers = mutable.LongMap.empty, aliveNodes = mutable.LongMap.empty)
 
@@ -267,7 +279,7 @@ class ZkMetadataCache(brokerId: Int) extends MetadataCache with Logging {
 
   private def getAllPartitions(snapshot: MetadataSnapshot): Map[TopicPartition, UpdateMetadataPartitionState] = {
     snapshot.partitionStates.flatMap { case (topic, partitionStates) =>
-      partitionStates.map { case (partition, state ) => (new TopicPartition(topic, partition.toInt), state) }
+      partitionStates.map { case (partition, state) => (new TopicPartition(topic, partition.toInt), state) }
     }.toMap
   }
 
@@ -327,7 +339,8 @@ class ZkMetadataCache(brokerId: Int) extends MetadataCache with Logging {
               broker.getNode(listenerName).getOrElse(Node.noNode())
             case None =>
               Node.noNode()
-          }}).toMap
+          }
+        }).toMap
         .filter(pair => pair match {
           case (_, node) => !node.isEmpty
         })
@@ -364,33 +377,49 @@ class ZkMetadataCache(brokerId: Int) extends MetadataCache with Logging {
       snapshot.controllerId.map(id => node(id)).orNull)
   }
 
-  // This method returns the deleted TopicPartitions received from UpdateMetadataRequest
+  /**
+   * 从Controller接收UpdateMetadataRequest，更新Broker本地缓存
+   * @param correlationId
+   * @param updateMetadataRequest
+   * @return The deleted topics from the given UpdateMetadataRequest.
+   */
   def updateMetadata(correlationId: Int, updateMetadataRequest: UpdateMetadataRequest): Seq[TopicPartition] = {
     inWriteLock(partitionMetadataLock) {
 
+      // 保存存活的Broker对象 Map<Broker ID, Broker对象>
       val aliveBrokers = new mutable.LongMap[Broker](metadataSnapshot.aliveBrokers.size)
+      // 保存存活的节点对象 Map<Broker ID, Map<监听器名称, 节点对象>>
       val aliveNodes = new mutable.LongMap[collection.Map[ListenerName, Node]](metadataSnapshot.aliveNodes.size)
+      // 从请求中获取Controller所在的Broker ID
       val controllerIdOpt = updateMetadataRequest.controllerId match {
         case id if id < 0 => None
         case id => Some(id)
       }
 
+      // 遍历请求中存活的Broker对象
       updateMetadataRequest.liveBrokers.forEach { broker =>
         // `aliveNodes` is a hot path for metadata requests for large clusters, so we use java.util.HashMap which
         // is a bit faster than scala.collection.mutable.HashMap. When we drop support for Scala 2.10, we could
         // move to `AnyRefMap`, which has comparable performance.
         val nodes = new java.util.HashMap[ListenerName, Node]
         val endPoints = new mutable.ArrayBuffer[EndPoint]
+        // 遍历为Broker配置的监听器
         broker.endpoints.forEach { ep =>
           val listenerName = new ListenerName(ep.listener)
           endPoints += new EndPoint(ep.host, ep.port, listenerName, SecurityProtocol.forId(ep.securityProtocol))
+          // 将<监听器,Broker节点对象>保存
           nodes.put(listenerName, new Node(broker.id, ep.host, ep.port))
         }
+        // 将Broker加入到存活的Broker对象集合
         aliveBrokers(broker.id) = Broker(broker.id, endPoints, Option(broker.rack))
+        // 将Broker节点加入到存活的节点对象集合
         aliveNodes(broker.id) = nodes.asScala
       }
+
+      // 获取当前Broker所有的<监听器, 节点>
       aliveNodes.get(brokerId).foreach { listenerMap =>
         val listeners = listenerMap.keySet
+        // 如果发现当前Broker配置的监听器与其它Broker有不同之处，记录错误日志
         if (!aliveNodes.values.forall(_.keySet == listeners))
           error(s"Listeners are not identical across brokers: $aliveNodes")
       }
@@ -402,12 +431,16 @@ class ZkMetadataCache(brokerId: Int) extends MetadataCache with Logging {
       topicIds ++= metadataSnapshot.topicIds
       topicIds ++= newTopicIds
 
+      // 构造已删除的分区数组，半其作为方法返回
       val deletedPartitions = new mutable.ArrayBuffer[TopicPartition]
+      // 请求中没有携带任何分区信息，则构造一个新的MetadataSnapshot元旦
       if (!updateMetadataRequest.partitionStates.iterator.hasNext) {
         metadataSnapshot = MetadataSnapshot(metadataSnapshot.partitionStates, topicIds.toMap, controllerIdOpt, aliveBrokers, aliveNodes)
       } else {
+        // 提取UpdateMetadataRequest请求中的数据，然后填充元数据缓存
         //since kafka may do partial metadata updates, we start by copying the previous state
         val partitionStates = new mutable.AnyRefMap[String, mutable.LongMap[UpdateMetadataPartitionState]](metadataSnapshot.partitionStates.size)
+        // 备份现有的元数据
         metadataSnapshot.partitionStates.forKeyValue { (topic, oldPartitionStates) =>
           val copy = new mutable.LongMap[UpdateMetadataPartitionState](oldPartitionStates.size)
           copy ++= oldPartitionStates

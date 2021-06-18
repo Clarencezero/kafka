@@ -52,10 +52,25 @@ public class FetchRequest extends AbstractRequest {
     private final FetchMetadata metadata;
 
     public static final class PartitionData {
+        /**
+         * 待读取消息的起始位移
+         */
         public final long fetchOffset;
+        /**
+         * 日志的起始位移值
+         */
         public final long logStartOffset;
+        /**
+         * 读取的最大字节数
+         */
         public final int maxBytes;
+        /**
+         * 当前Leader版本号
+         */
         public final Optional<Integer> currentLeaderEpoch;
+        /**
+         * 上次拉取的版本号
+         */
         public final Optional<Integer> lastFetchedEpoch;
 
         public PartitionData(
@@ -68,11 +83,11 @@ public class FetchRequest extends AbstractRequest {
         }
 
         public PartitionData(
-            long fetchOffset,
-            long logStartOffset,
-            int maxBytes,
-            Optional<Integer> currentLeaderEpoch,
-            Optional<Integer> lastFetchedEpoch
+            long fetchOffset,    // 待获取的起始位移值
+            long logStartOffset, // 起始位移值
+            int maxBytes,        // 最大字节数，默认值：1048576，即1MB
+            Optional<Integer> currentLeaderEpoch, // 当前副本Leader版本号
+            Optional<Integer> lastFetchedEpoch    // 上一次获取版本号
         ) {
             this.fetchOffset = fetchOffset;
             this.logStartOffset = logStartOffset;

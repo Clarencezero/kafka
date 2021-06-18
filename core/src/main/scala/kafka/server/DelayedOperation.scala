@@ -188,6 +188,7 @@ final class DelayedOperationPurgatory[T <: DelayedOperation](purgatoryName: Stri
     expirationReaper.start()
 
   /**
+   *
    * Check if the operation can be completed, if not watch it based on the given watch keys
    *
    * Note that a delayed operation can be watched on multiple keys. It is possible that

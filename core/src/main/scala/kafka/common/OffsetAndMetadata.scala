@@ -19,6 +19,14 @@ package kafka.common
 
 import java.util.Optional
 
+/**
+ *
+ * param offset
+ * @param leaderEpoch
+ * @param metadata
+ * @param commitTimestamp
+ * @param expireTimestamp
+ */
 case class OffsetAndMetadata(offset: Long,
                              leaderEpoch: Optional[Integer],
                              metadata: String,

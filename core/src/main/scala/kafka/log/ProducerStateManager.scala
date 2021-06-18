@@ -87,6 +87,16 @@ private[log] case class BatchMetadata(lastSeq: Int, lastOffset: Long, offsetDelt
 // the batchMetadata is ordered such that the batch with the lowest sequence is at the head of the queue while the
 // batch with the highest sequence is at the tail of the queue. We will retain at most ProducerStateEntry.NumBatchesToRetain
 // elements in the queue. When the queue is at capacity, we remove the first element to make space for the incoming batch.
+
+/**
+ *
+ * @param producerId
+ * @param batchMetadata
+ * @param producerEpoch
+ * @param coordinatorEpoch
+ * @param lastTimestamp
+ * @param currentTxnFirstOffset
+ */
 private[log] class ProducerStateEntry(val producerId: Long,
                                       val batchMetadata: mutable.Queue[BatchMetadata],
                                       var producerEpoch: Short,
@@ -480,6 +490,10 @@ object ProducerStateManager {
  * age. This ensures that producer ids will not be expired until either the max expiration time has been reached,
  * or if the topic also is configured for deletion, the segment containing the last written offset has
  * been deleted.
+ *
+ * @param topicPartition
+ * @param _logDir
+ * @param maxProducerIdExpirationMs
  */
 @nonthreadsafe
 class ProducerStateManager(val topicPartition: TopicPartition,
@@ -494,6 +508,9 @@ class ProducerStateManager(val topicPartition: TopicPartition,
     loadSnapshots()
   }
 
+  /**
+   * 存储每个生产者最近5个请求
+   */
   private val producers = mutable.Map.empty[Long, ProducerStateEntry]
   private var lastMapOffset = 0L
   private var lastSnapOffset = 0L
